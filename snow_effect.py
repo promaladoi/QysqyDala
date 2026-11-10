@@ -16,6 +16,7 @@ from render import PaintEngine, SnowScreen, figure_bounds, inside_platform
 from shovel import SnowShovel
 from simulation import SnowSimulation
 from snowman import MAX_RADIUS, Snowmen
+from snowplow import Snowplow
 from win32 import (
     APP_NAME, CreateWindowExW, DefWindowProcW, DestroyWindow, GetModuleHandleW, GUIThreadInfo, MSG,
     RegisterClassW, TaskbarTracker, WNDCLASSW, WNDPROC, bind, display_refresh_hz,
@@ -281,7 +282,7 @@ class DragPreview:
             self.screen.render((), (), figures, local_windows, local(work_area),
                                local_platforms, shovel=blade)
             self.key = key
-        if raise_layer and self.screen.visible:
+        if self.screen.visible and raise_layer:
             self.screen.overlay.show()
 
     def hide(self):
@@ -318,6 +319,7 @@ class SnowEffect:
         self.snowmen = Snowmen()
         self.snowmen.enabled = load_snowman_mode()
         self.shovel = SnowShovel()
+        self.plow = Snowplow()
         self.pointer = wt.POINT()
         self.drag_button = VK_LBUTTON
         self.enabled = False
@@ -413,6 +415,7 @@ class SnowEffect:
             self.simulation.clear()
             self.snowmen.clear()
             self.shovel.cancel_drag()
+            self.plow.clear()
             self.hide_scene()
         self.update_tip()
         notify_icon(NIM_MODIFY, ct.byref(self.tray))
@@ -421,6 +424,7 @@ class SnowEffect:
         self.snow_frame = False
         if self.mouse_tool.dragging and not self.displays_dirty and now < self.next_snow_frame - 0.002:
             self.update_drag()
+            self.plow.capture_held(self.snowmen, visible=self.surface_visible)
             if self.mouse_tool.dragging:
                 self.paint_drag_preview()
                 return
@@ -444,6 +448,7 @@ class SnowEffect:
                 self.simulation.configure(monitors, list(layout.values()))
                 self.snowmen.clear()
                 self.shovel.cancel_drag()
+                self.plow.clear()
             self.base_layout = layout
             self.work_areas = self.taskbars.desktop_areas(layout)
             self.displays_dirty = False
@@ -460,9 +465,11 @@ class SnowEffect:
             if any(window != previous_bounds.get(window[0], window) for window in self.windows):
                 self.window_motion_until = now + WINDOW_MOTION_GRACE
         self.window_moving = native_move or now < self.window_motion_until
-        if (self.desktop_covered() and not self.snowmen.dragging
-                and not any(ball.thrown for ball in self.snowmen.moving)):
+        covered = self.desktop_covered()
+        if (covered and not self.snowmen.dragging and not self.snowmen.visible_flight
+                and not self.simulation.impact_active):
             self.update_drag()
+            self.plow.step(self.simulation, self.snowmen, dt, paused=True)
             self.hide_scene()
             return
         self.simulation.update_windows(self.windows, elapsed=dt)
@@ -472,15 +479,23 @@ class SnowEffect:
         )
         self.snowmen.step(self.simulation, self.windows, dt=dt, visible=self.surface_visible)
         self.update_drag()
+        self.plow.step(self.simulation, self.snowmen, dt, paused=covered or self.shovel.dragging,
+                       visible=self.surface_visible)
         # Commit the held tool before the slower monitor-sized weather draw.
         self.paint_drag_preview()
         self.simulation.step(dt, INTENSITIES[self.intensity][1])
         drifts = list(self.simulation.drifts())
+        falling = tuple(self.simulation.falling_drifts())
+        interactive = self.mouse_tool.enabled and not self.window_moving
+        art_drifts = falling if interactive else drifts
+        if falling and not interactive:
+            art_drifts = (*drifts, *falling)
         stationary = self.snowmen.scene()
         owners = self.snowmen.scene_owners()
         moving = self.snowmen.moving_scene()
         moving_owners = self.snowmen.moving_scene_owners()
         flakes = self.simulation.particles
+        impact_flakes = tuple(self.simulation.impact_flakes())
         if self.window_moving:
             # Draw the entire scene on one click-through layer during a window drag.
             for control in self.snow_controls.values():
@@ -499,7 +514,12 @@ class SnowEffect:
             work_area = self.work_areas[screen.rect]
             platforms = self.platforms.get(screen.rect, ())
             art_visible = screen.visible
-            if self.mouse_tool.enabled and not self.window_moving:
+            plow = self.plow.scene(screen.rect)
+            plow_pitch = self.plow.pitch(screen.rect) if plow is not None else 0.0
+            pushed = self.plow.pushed_scene(screen.rect)
+            figures = art_figures + pushed if pushed else art_figures
+            figure_owners = art_owners + (0,) * len(pushed) if pushed else art_owners
+            if interactive:
                 control = self.snow_controls.get(screen.rect)
                 if control is None:
                     control = SnowScreen(self.engine, screen.rect, self.on_snow_pointer)
@@ -507,15 +527,17 @@ class SnowEffect:
                 was_visible = control.visible
                 control.render((), drifts, stationary if self.snowmen.enabled else (),
                                self.windows, work_area, platforms, snowmen_owners=owners)
-                screen.render(flakes, (), art_figures, self.windows,
-                              work_area, platforms, snowmen_owners=art_owners, costumes=costumes)
+                screen.render(flakes, art_drifts, figures, self.windows,
+                              work_area, platforms, snowmen_owners=figure_owners, costumes=costumes,
+                              plow=plow, plow_pitch=plow_pitch, impact_flakes=impact_flakes)
                 if control.visible and not was_visible and screen.visible:
                     screen.overlay.show()
                     raised_layer = True
             else:
-                screen.render(flakes, drifts, art_figures, self.windows,
-                              work_area, platforms, snowmen_owners=art_owners,
-                              cache_costumes=self.window_moving)
+                screen.render(flakes, art_drifts, figures, self.windows,
+                              work_area, platforms, snowmen_owners=figure_owners,
+                              cache_costumes=self.window_moving, plow=plow, plow_pitch=plow_pitch,
+                              impact_flakes=impact_flakes)
             raised_layer |= screen.visible and not art_visible
         if raised_layer:
             self.paint_drag_preview(True)
@@ -588,7 +610,9 @@ class SnowEffect:
         for (_, stack_preview), preview in self.drag_previews.items():
             if stack_preview != whole:
                 preview.hide()
-        for rect, work in self.work_areas.items():
+        for screen in self.screens:
+            rect = screen.rect
+            work = self.work_areas[rect]
             left, top, right, bottom = work
             key = rect, whole
             preview = self.drag_previews.get(key)

@@ -1,11 +1,11 @@
 """Snowfall and window-edge accumulation in physical desktop pixels."""
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import chain
-from math import ceil, exp, floor, inf, pi, sin, sqrt
+from math import ceil, cos, exp, floor, inf, pi, sin, sqrt
 from operator import itemgetter
 from random import Random
 from typing import NamedTuple
@@ -18,6 +18,7 @@ Platform = tuple[int, int, int, int, float]
 GroundSpan = tuple[int, int, int, Platform | None]
 Visibility = Callable[[int, float, float], bool]
 DepthSnapshot = tuple[int, int, int, list[float]]
+ImpactPose = tuple[float, ...]  # x, base y, then the visible layer radii
 _POINT_Y = itemgetter(1)
 
 MAX_DEPTH = 27
@@ -29,6 +30,8 @@ LANDING_BAND = 32
 SHOVEL_REACH = 52
 SHOVEL_STEP = 8
 SHOVEL_TAIL = 12
+MAX_IMPACT_GRAINS = 144
+IMPACT_GRAVITY = 1450.0
 
 
 def _platform_top(platform: Platform, x: float) -> float:
@@ -74,13 +77,62 @@ class DriftPolygon(list[Point]):
 
     __slots__ = ("hwnd", "left", "right", "top", "bottom", "curved")
 
-    def __init__(self, points: list[Point], hwnd: int, left: int, right: int, curved: bool):
+    def __init__(self, points: Iterable[Point], hwnd: int, left: float, right: float, curved: bool):
         super().__init__(points)
         self.hwnd = hwnd
         self.left, self.right = left, right
         self.top = min(map(_POINT_Y, self))
         self.bottom = max(map(_POINT_Y, self)) if curved else self[0][1]
         self.curved = curved
+
+
+@dataclass(slots=True)
+class _FallingBank:
+    outline: DriftPolygon
+    columns: list[tuple[float, float, float, float]]
+    shapes: tuple[DriftPolygon, ...]
+    y: float
+    speed: float = 0.0
+    impact_height: int = 0
+    expanded: set[int] = field(default_factory=set)
+
+    def trim(self) -> None:
+        spans = []
+        for index, (left, right, _, _) in enumerate(self.columns):
+            if spans and left <= spans[-1][3] + 1e-7:
+                first, _, start, _ = spans[-1]
+                spans[-1] = first, index + 1, start, right
+            else:
+                spans.append((index, index + 1, left, right))
+        outline = self.outline
+
+        def top_at(x):
+            index = bisect_right(outline, (x, inf))
+            if index == len(outline):
+                return outline[-1][1]
+            x1, y1 = outline[index - 1]
+            x2, y2 = outline[index]
+            return y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+
+        shapes = []
+        baseline = outline.bottom
+        for first, last, left, right in spans:
+            middle = outline[bisect_right(outline, (left, inf)):bisect_left(outline, (right, -inf))]
+            points = [(left, top_at(left)), *middle, (right, top_at(right))]
+            columns = self.columns[first:last]
+            fractions = [depth / original for _, _, depth, original in columns]
+            if any(fraction < 1 for fraction in fractions):
+                # After partial contact, the remaining strip keeps its local share of the crest.
+                centers = [(x1 + x2) / 2 for x1, x2, _, _ in columns]
+                for index, (x, y) in enumerate(points):
+                    b = min(bisect_right(centers, x), len(centers) - 1)
+                    a = max(0, b - 1)
+                    t = (x - centers[a]) / (centers[b] - centers[a]) if a != b else 0.0
+                    scale = fractions[a] + (fractions[b] - fractions[a]) * min(1.0, max(0.0, t))
+                    points[index] = x, baseline - (baseline - y) * scale
+            shapes.append(DriftPolygon(((left, baseline), *points, (right, baseline)),
+                                       0, left, right, False))
+        self.shapes = tuple(shapes)
 
 
 class BallLanding(NamedTuple):
@@ -106,6 +158,48 @@ class Flake:
 
 
 @dataclass(slots=True)
+class _ImpactGrain:
+    x: float
+    y: float
+    radius: float
+    vx: float
+    vy: float
+    alpha: int
+
+    def height_at(self, age: float) -> float:
+        return self.y + (self.vy + 0.5 * IMPACT_GRAVITY * age) * age
+
+
+@dataclass(slots=True)
+class _ImpactPowder:
+    core: Flake
+    grains: tuple[_ImpactGrain, ...]
+    total_volume: float
+    age: float | None = None
+
+
+def _impact_grains(poses: Sequence[ImpactPose], rng: Random):
+    layers = []
+    for x, baseline, *radii in poses:
+        for radius in radii:
+            layers.append((x, baseline - radius, radius))
+            baseline -= 1.8 * radius
+    area = sum(radius * radius for _, _, radius in layers)
+    minimum = 3 * len(layers)
+    budget = min(112, max(24, minimum, ceil(area / 13)))
+    for x, y, radius in layers:
+        count = 3 + floor((budget - minimum) * radius * radius / area)
+        angle = rng.uniform(0.0, 2 * pi)
+        for index in range(count):
+            distance = radius * sqrt((index + 0.5) / count)
+            side = cos(angle)
+            yield _ImpactGrain(x + distance * side, y + distance * sin(angle),
+                               rng.uniform(1.2, 2.75), side * rng.uniform(85, 215),
+                               -rng.uniform(44, 185), rng.randrange(184, 251))
+            angle += 2.399963  # golden angle, for even coverage across each circle
+
+
+@dataclass(slots=True)
 class _Pile:
     width: int
     depths: list[float]
@@ -113,6 +207,7 @@ class _Pile:
     vx: float = 0.0
     vy: float = 0.0
     revision: int = 0
+    impact_ceiling: int = 0
 
     def depth_at(self, x: float) -> float:
         if not self.depths:
@@ -137,7 +232,7 @@ class _Pile:
             index = center + offset
             if 0 <= index < count:
                 depth = self.depths[index]
-                settled = min(self.max_depth, depth + weight * radius)
+                settled = max(depth, min(self.max_depth, depth + weight * radius))
                 if settled != depth:
                     self.depths[index] = settled
                     changed = True
@@ -431,6 +526,8 @@ def _limit_spans(
 class SnowSimulation:
     def __init__(self, seed: int | None = None) -> None:
         self.particles: list[Flake] = []
+        self._falling_banks: list[_FallingBank] = []
+        self._impact_powder: list[_ImpactPowder] = []
         self._random = Random(seed)
         self._monitors: tuple[Rect, ...] = ()
         self._monitor_weights: list[int] = []
@@ -451,6 +548,7 @@ class SnowSimulation:
         self._previous_landing_bands = None
         self._stable_landing_frames = 0
         self._first_landing_y = float("inf")
+        self._max_clearance = GROUND_DEPTH
         self._sliding = False
         self._spawn_balance = 0.0
         self._needs_seed = True
@@ -523,6 +621,136 @@ class SnowSimulation:
                     nearest, best_distance = bottom, distance
         return nearest
 
+    def desktop_floors(self) -> Iterator[tuple[Rect, Rect]]:
+        """Pair each physical screen with the work area containing its floor."""
+        yield from zip(self._monitors, self._grounds)
+
+    def taskbar_support(self, screen: Rect, x: float) -> tuple[int, float] | None:
+        """Return the start and local top of the visible bottom taskbar under x."""
+        for left, right, floor_y, platform in self._ground_profiles[self._monitors.index(screen)]:
+            if platform is not None and left <= x < right:
+                return left, min(floor_y, _platform_top(platform, x))
+        return None
+
+    def floor_snow_coverage(self, screen: Rect, depth: float) -> float:
+        """Measure visible thick snow against the whole desktop floor, excluding raised docks."""
+        index = self._monitors.index(screen)
+        pile = self._ground_piles[index]
+        depths = pile.depths
+        if not depths:
+            return 0.0
+        origin, baseline = screen[0], self._grounds[index][3]
+        step = pile.width / len(depths)
+        eligible = 0
+        for left, right, _, platform in self._ground_profiles[index]:
+            if platform is None:
+                first = ceil((left - origin) / step - 1e-9)
+                last = floor((right - origin) / step + 1e-9)
+                eligible += max(0, last - first)
+        thick = 0
+        for surface in self._surfaces:
+            if surface.pile is not pile or surface.y != baseline or surface.clearance < depth:
+                continue
+            first = max(0, ceil((surface.left - origin) / step - 1e-9))
+            last = min(len(depths), floor((surface.right - origin) / step + 1e-9))
+            thick += sum(amount >= depth for amount in depths[first:last])
+        return thick / eligible if eligible else 0.0
+
+    def sweep_desktop_floor(self, screen: Rect, left: float, right: float, *, blade_lift=0.0,
+                            previous_lift=None, panel_gap=None, blade_height=0.0, visible=None) -> float:
+        """Clear cells on blade contact, optionally including the raised taskbar."""
+        index = self._monitors.index(screen)
+        pile = self._ground_piles[index]
+        depths = pile.depths
+        if not depths:
+            return 0.0
+        origin = screen[0]
+        count = len(depths)
+        step = pile.width / count
+
+        def edges_through(x: float) -> int:
+            if x >= origin + pile.width:
+                return count
+            index = min(count - 1, max(0, floor((x - origin) / step)))
+            # Check the physical edge when division rounds near a cell boundary.
+            if index and origin + index * step > x:
+                index -= 1
+            elif index + 1 < count and origin + (index + 1) * step <= x:
+                index += 1
+            return index
+
+        crossed_first = edges_through(left)
+        crossed_last = edges_through(right)
+        if crossed_first >= crossed_last:
+            return 0.0
+        removed = 0.0
+        for span_left, span_right, _, platform in self._ground_profiles[index]:
+            if platform is not None or span_right <= left or span_left >= right:
+                continue
+            first = max(crossed_first, ceil((span_left - origin) / step - 1e-9))
+            last = min(crossed_last, floor((span_right - origin) / step + 1e-9))
+            if first < last:
+                if blade_lift <= 0.0:
+                    removed += sum(depths[first:last])
+                    depths[first:last] = [0.0] * (last - first)
+                else:
+                    for cell in range(first, last):
+                        if depths[cell] > blade_lift:
+                            removed += depths[cell] - blade_lift
+                            depths[cell] = blade_lift
+        if panel_gap is not None:
+            floor_y = self._grounds[index][3]
+            blade_y = floor_y - blade_lift
+            old_y = blade_y if previous_lift is None else floor_y - previous_lift
+            slope = (blade_y - old_y) / (right - left)
+            first_surface = bisect_left(
+                self._surface_ys, min(old_y, blade_y) - max(panel_gap, blade_height) - self._curve_reach,
+            )
+            last_surface = bisect_right(
+                self._surface_ys, min(floor_y - 1, max(old_y, blade_y) + GROUND_DEPTH + panel_gap),
+            )
+            for surface in self._surfaces[first_surface:last_surface]:
+                if surface.pile is not pile or surface.right <= left or surface.left >= right:
+                    continue
+                first = max(crossed_first, ceil((surface.left - origin) / step - 1e-9))
+                last = min(crossed_last, floor((surface.right - origin) / step + 1e-9))
+                for cell in range(first, last):
+                    edge = origin + (cell + 1) * step
+                    x = edge - step / 2
+                    support_y = surface.baseline_at(x)
+                    gap = support_y - (old_y + (edge - left) * slope)
+                    exposed = min(depths[cell], surface.clearance)
+                    remaining = max(0.0, gap - panel_gap)
+                    # Check the portion of the bank which meets the visible
+                    # face of the blade, including while the lip climbs.
+                    contact_depth = min(exposed, gap + max(panel_gap, blade_height))
+                    if (contact_depth <= remaining or (visible is not None
+                            and not visible(0, x, support_y - (contact_depth + remaining) / 2))):
+                        continue
+                    amount = exposed - remaining
+                    depths[cell] -= amount
+                    removed += amount
+        if removed:
+            pile.revision += 1
+        return removed * step
+
+    def on_desktop_floor(self, screen: Rect, x: float, y: float) -> bool:
+        """Distinguish actual desktop support from any raised taskbar platform."""
+        index = self._monitors.index(screen)
+        return any(platform is None and left <= x < right and abs(y - baseline) <= 1
+                   for left, right, baseline, platform in self._ground_profiles[index])
+
+    def on_taskbar_platform(self, screen: Rect, x: float, y: float, blade_lift: float,
+                            panel_gap: float, *, height=0.0) -> bool:
+        """Check whether a raised taskbar supports an object within blade reach."""
+        support = self.taskbar_support(screen, x)
+        if support is None:
+            return False
+        _, support_y = support
+        floor_y = self._grounds[self._monitors.index(screen)][3]
+        gap = support_y - (floor_y - blade_lift)
+        return abs(y - support_y) <= 1 and -panel_gap <= gap <= height + panel_gap
+
     def update_windows(self, windows: Sequence[Window], elapsed: float = 1 / 60) -> None:
         """Set (HWND, left, top, right, bottom) for visible windows, frontmost first."""
         snapshot = tuple(window for window in windows if window[1] < window[3] and window[2] < window[4])
@@ -546,11 +774,11 @@ class SnowSimulation:
                 pile.vx = pile.vy = 0.0
             current[hwnd] = pile
         if changed:
-            for hwnd, left, top, _, _ in self._windows:
-                if hwnd not in current:
-                    pile = self._piles[hwnd]
-                    for x, volume in pile.loosen(1.0):
-                        self._spill(left + x, top - 3, volume, pile.vx, pile.vy)
+            closed = previous.keys() - current.keys()
+            if closed:
+                for surface in self._surfaces:
+                    if surface.hwnd in closed:
+                        self._release_bank(surface)
         self._piles = current
         self._windows = snapshot
         if changed:
@@ -594,14 +822,15 @@ class SnowSimulation:
 
         for hwnd, left, top, right, bottom in self._windows:
             pile = self._piles[hwnd]
+            ceiling = max(pile.max_depth, pile.impact_ceiling)
             inset = min(WINDOW_CORNER_INSET, (right - left) // 6)
             for screen_left, screen_top, screen_right, screen_bottom in self._monitors:
                 start, end = max(left + inset, screen_left), min(right - inset, screen_right)
                 if start >= end or not screen_top < top <= screen_bottom:
                     continue
-                spans = [(start, end, min(MAX_DEPTH, top - screen_top))]
+                spans = [(start, end, min(ceiling, top - screen_top))]
                 for blocker_left, blocker_top, blocker_right, blocker_bottom in previous:
-                    if (blocker_top <= top and blocker_bottom > top - MAX_DEPTH and
+                    if (blocker_top <= top and blocker_bottom > top - ceiling and
                             blocker_left < end and blocker_right > start):
                         clearance = max(0, top - blocker_bottom)
                         spans = _limit_spans(spans, blocker_left, blocker_right, clearance)
@@ -611,14 +840,15 @@ class SnowSimulation:
             previous.append((left, top, right, bottom))
         for profiles, ground, pile, screen in zip(
                 self._ground_profiles, self._grounds, self._ground_piles, self._monitors):
+            ceiling = max(pile.max_depth, pile.impact_ceiling)
             for left, right, floor_y, platform in profiles:
                 y = floor_y if platform is None else platform[1]
-                clearance = min(GROUND_DEPTH, y - ground[1])
+                clearance = min(ceiling, y - ground[1])
                 if clearance <= 0:
                     continue
                 spans = [(left, right, clearance)]
                 for blocker_left, blocker_top, blocker_right, blocker_bottom in previous:
-                    if (blocker_top < y and blocker_bottom > y - GROUND_DEPTH and
+                    if (blocker_top < y and blocker_bottom > y - ceiling and
                             blocker_left < right and blocker_right > left):
                         limit = max(0, y - blocker_bottom)
                         spans = _limit_spans(spans, blocker_left, blocker_right, limit)
@@ -646,14 +876,23 @@ class SnowSimulation:
         self._landing_bands = bands
         self._adjacent_landing_bands = adjacent
         self._first_landing_y = first_landing_y
+        self._max_clearance = max((surface.clearance for surface in surfaces), default=GROUND_DEPTH)
 
     def clear(self) -> None:
         """Drop all flakes and drifts, retaining the current display and window geometry."""
         self.particles.clear()
+        self._falling_banks.clear()
+        self._impact_powder.clear()
+        tall = False
         for pile in (*self._piles.values(), *self._ground_piles):
             pile.depths.clear()
             pile.vx = pile.vy = 0.0
             pile.revision += 1
+            if pile.impact_ceiling:
+                pile.impact_ceiling = 0
+                tall = True
+        if tall:
+            self._rebuild_surfaces()
         self._sliding = False
         self._spawn_balance = 0.0
         self._needs_seed = True
@@ -669,9 +908,10 @@ class SnowSimulation:
         return self._window_rank.get(hwnd, len(self._window_rank) + (hwnd != 0))
 
     def support_at(self, x: float, y: float, reach: float = 40, *, hwnd: int | None = None,
-                   visible: Visibility | None = None) -> tuple[int, int, int, int] | None:
+                   visible: Visibility | None = None,
+                   within_snow: bool = False) -> tuple[int, int, int, int] | None:
         """Return (HWND or 0 for ground, left, right, y) for the closest visible ledge."""
-        surface = self._nearby_surface(x, y, reach, hwnd=hwnd, visible=visible)
+        surface = self._nearby_surface(x, y, reach, hwnd=hwnd, visible=visible, within_snow=within_snow)
         if surface is not None:
             return surface.hwnd, surface.left, surface.right, round(surface.baseline_at(x))
         return None
@@ -722,11 +962,11 @@ class SnowSimulation:
 
     def _nearby_surface(self, x: float, y: float, reach: float,
                         above: float | None = None, *, hwnd: int | None = None,
-                        visible: Visibility | None = None) -> _Surface | None:
+                        visible: Visibility | None = None, within_snow: bool = False) -> _Surface | None:
         min_y = y - (reach if above is None else min(reach, above))
         first = bisect_left(self._surface_ys, min_y - self._curve_reach)
-        last = bisect_right(self._surface_ys, y + reach)
-        best = reach
+        best = max(reach, self._max_clearance + 2) if within_snow and self._max_clearance > GROUND_DEPTH else reach
+        last = bisect_right(self._surface_ys, y + best)
         nearest = None
         for index in range(first, last):
             surface = self._surfaces[index]
@@ -738,6 +978,8 @@ class SnowSimulation:
                     continue
                 distance = abs(ledge - y)
                 if distance < best or (nearest is None and distance <= best):
+                    if distance > reach and (ledge < y or distance > surface.depth_at(x) + 2):
+                        continue
                     if visible is None or visible(surface.hwnd, x, y):
                         best, nearest = distance, surface
         return nearest
@@ -750,7 +992,7 @@ class SnowSimulation:
         if radius <= 0 or (maximum is not None and maximum <= 0):
             return 0.0
         surface = self._nearby_surface(x, y + radius, radius if reach is None else reach, above,
-                                       hwnd=hwnd, visible=visible)
+                                       hwnd=hwnd, visible=visible, within_snow=True)
         if surface is None or not surface.pile.depths:
             return 0.0
         pile = surface.pile
@@ -778,7 +1020,7 @@ class SnowSimulation:
         dx = x1 - x0
         if abs(dx) < 0.5:
             return 0.0
-        surface = self._nearby_surface(x0, y0, SHOVEL_REACH, 8, hwnd=hwnd, visible=visible)
+        surface = self._nearby_surface(x0, y0, SHOVEL_REACH, 8, hwnd=hwnd, visible=visible, within_snow=True)
         if surface is None or not surface.pile.depths:
             return 0.0
         direction = 1 if dx > 0 else -1
@@ -787,6 +1029,9 @@ class SnowSimulation:
         pieces = ceil(travel / SHOVEL_STEP)
         pile = surface.pile
         origin = surface.window_left
+        reach = SHOVEL_REACH
+        if surface.clearance > reach:
+            reach = max(reach, surface.depth_at(x0) + 2)
         inset = min(WINDOW_CORNER_INSET, pile.width // 6) if surface.hwnd else 0
         real_end = (surface.right == origin + pile.width - inset if direction > 0
                     else surface.left == origin + inset)
@@ -805,7 +1050,7 @@ class SnowSimulation:
             crossed_edge = not surface.left <= x < surface.right
             blade_x = min(surface.right - 0.001, max(surface.left, x))
             offset_y = y - surface.baseline_at(blade_x)
-            if not -SHOVEL_REACH <= offset_y <= 8:
+            if not -reach <= offset_y <= 8:
                 break
             if visible is not None and not visible(surface.hwnd, blade_x, y):
                 break
@@ -860,7 +1105,7 @@ class SnowSimulation:
             x = origin + (index + 0.5) * cell_width
             return visible(surface.hwnd, x, surface.baseline_at(x) + offset_y)
 
-        limit = min(surface.clearance, pile.max_depth)
+        limit = surface.clearance
         available = []
         for index in sources:
             if not accessible(index):
@@ -911,6 +1156,177 @@ class SnowSimulation:
             self.particles.append(Flake(x, y, radius, 246, vy, vx, 0.0, 0.0,
                                         amount, may_bounce=radius >= 7, shoveled=shoveled))
 
+    def deposit_impact_mound(self, x: float, y: float, volume: float, *, hwnd: int | None = None,
+                             poses: Sequence[ImpactPose] = ()) -> bool:
+        """Send a compact patch of powder down to a single mound on the first support."""
+        if volume <= 0:
+            return False
+        surface = self._nearby_surface(x, y, 2, hwnd=hwnd) if hwnd is not None else None
+        if surface is None:
+            landing = self.ball_landing(x, y - 2, x, self._desktop_bounds[2] + 1)
+            if landing is not None:
+                surface = self._nearby_surface(x, landing.y, 2, hwnd=landing.owner)
+            if surface is None:
+                surface = self._covered_floor(x, y - 2)
+        if surface is None:
+            return False
+        size = sqrt(volume)
+        top = surface.baseline_at(x) - surface.depth_at(x)
+        y = min(y, top - min(35.0, max(22.0, size * 0.55)))
+        if not poses:
+            radius = min(24.0, max(5.0, size * 0.5))
+            poses = ((x, y + radius * 0.65, radius),)
+        grains = tuple(_impact_grains(poses, self._random))
+        start = min(y, *(grain.y for grain in grains))
+        core = Flake(x, start, 0.0, 0, 0.0, 0.0, 0.0, 0.0, volume, shoveled=True)
+        self._impact_powder.append(_ImpactPowder(core, grains, volume))
+        return True
+
+    def impact_flakes(self) -> Iterator[Flake]:
+        """Draw the temporary powder with ordinary snowflake sizes and a fixed visual budget."""
+        remaining = MAX_IMPACT_GRAINS
+        bursts = len(self._impact_powder)
+        for powder in reversed(self._impact_powder):
+            grains = powder.grains
+            count = min(len(grains), (remaining + bursts - 1) // bursts)
+            if count < len(grains):
+                # Keep samples from the head as well as the base when impacts overlap in time.
+                grains = tuple(grains[index * len(grains) // count] for index in range(count))
+            age = powder.age or 0.0
+            spread = age * exp(-2.9 * age)
+            close_in = min(0.55, 0.58 * age)
+            for grain in grains:
+                x = grain.x + grain.vx * spread + (powder.core.x - grain.x) * close_in
+                yield Flake(x, grain.height_at(age), grain.radius, grain.alpha, 0.0, 0.0, 0.0, 0.0)
+            remaining -= count
+            bursts -= 1
+            if remaining <= 0:
+                break
+
+    @property
+    def impact_active(self) -> bool:
+        return bool(self._impact_powder)
+
+    def _covered_floor(self, x: float, y: float) -> _Surface | None:
+        floor = min(((ground[3], ground, screen[0], pile)
+                     for screen, ground, pile in zip(self._monitors, self._grounds, self._ground_piles)
+                     if ground[0] <= x < ground[2] and ground[1] < ground[3] and ground[3] >= y),
+                    key=itemgetter(0), default=None)
+        if floor is None:
+            return None
+        baseline, (left, top, right, _), origin, pile = floor
+        return _Surface(left, right, baseline, baseline - top, origin, pile)
+
+    def _pack_impact_mound(self, surface: _Surface, x: float, volume: float, *,
+                           hidden: bool = False, shape_volume: float | None = None,
+                           reserve_volume: float | None = None) -> bool:
+        """Add snow to one rounded mound with a footprint fixed by its final volume."""
+        if volume <= 0:
+            return False
+        pile, origin = surface.pile, surface.window_left
+        count = len(pile.depths) or ceil(pile.width / CELL_WIDTH)
+        step = pile.width / count
+        first = max(0, ceil((surface.left - origin) / step))
+        last = min(count, floor((surface.right - origin) / step + 1e-9))
+        if first >= last:
+            return False
+        footprint = volume if shape_volume is None else max(volume, shape_volume)
+        width = min(last - first, max(3, ceil(2.45 * sqrt(footprint) / step)))
+        center = floor((x - origin) / step)
+        start = min(last - width, max(first, center - width // 2))
+        cells = range(start, start + width)
+        crest = 0.40
+        shape = []
+        for index in range(width):
+            position = (index + 0.5) / width
+            if position < crest:
+                distance = (crest - position) / crest
+            else:
+                distance = (position - crest) / (1 - crest)
+            shape.append((1 - distance * distance) ** 1.25)
+        previous = pile.depths[start:start + width] if pile.depths else [0.0] * width
+        owner = surface.hwnd
+        y = surface.y
+        top = next((screen[1] if owner else ground[1]
+                    for screen, ground in zip(self._monitors, self._grounds)
+                    if screen[0] <= x < screen[2] and screen[1] < y <= screen[3]), y)
+        blockers = () if hidden else self._windows[:self.owner_rank(owner)] if owner else self._windows
+        obstacles = [(left, right, bottom) for _, left, upper, right, bottom in blockers
+                     if (upper <= y if owner else upper < y) and bottom > top]
+        free = []
+        for cell, depth in zip(cells, previous):
+            left, right = origin + cell * step, origin + (cell + 1) * step
+            ceiling = max((bottom for x1, x2, bottom in obstacles if left < x2 and x1 < right), default=top)
+            free.append(max(0.0, y - ceiling - depth))
+        remaining = volume / step
+        required = volume if reserve_volume is None else reserve_volume
+        if sum(free) + 1e-9 < required / step:
+            return False
+        weight = sum(shape)
+        scale = remaining / weight
+        if any(height * scale > room for height, room in zip(shape, free)):
+            # Fill restricted cells first and keep the rest of the dome rounded.
+            for height, room in sorted(zip(shape, free), key=lambda cell: cell[1] / cell[0]):
+                if height * scale <= room:
+                    break
+                remaining -= room
+                weight -= height
+                scale = remaining / weight if weight > 1e-9 else inf
+        packed = [depth + min(room, height * scale)
+                  for depth, room, height in zip(previous, free, shape)]
+        if not pile.depths:
+            pile.depths = [0.0] * count
+        pile.depths[start:start + width] = packed
+        pile.revision += 1
+        ceiling = ceil(max(packed))
+        if ceiling > max(pile.max_depth, pile.impact_ceiling):
+            pile.impact_ceiling = ((ceiling + 7) // 8) * 8
+            self._rebuild_surfaces()
+        return True
+
+    def _advance_impact_powder(self, dt: float) -> None:
+        pending = []
+        bottom = self._desktop_bounds[2] + 16
+        for powder in self._impact_powder:
+            if powder.age is None:
+                # The first paint starts at the exact impact poses, even if physics already advanced.
+                powder.age = 0.0
+                pending.append(powder)
+                continue
+            powder.age += dt
+            core, grains, age = powder.core, powder.grains, powder.age
+            falling = [(index, grain.height_at(age) + grain.radius) for index, grain in enumerate(grains)
+                       if grain.vy + IMPACT_GRAVITY * age > 0]
+            front = max((height for _, height in falling), default=core.y)
+            if front >= core.y:
+                surface = self._landing(core, core.x, front)
+                hidden = surface is None
+                if hidden:
+                    surface = self._covered_floor(core.x, core.y)
+                if surface is None:
+                    core.y = front
+                else:
+                    baseline = surface.baseline_at(core.x)
+                    top = baseline - surface.depth_at(core.x)
+                    arrived = {index for index, height in falling if height >= max(core.y, top)}
+                    if arrived:
+                        share = core.volume * (len(arrived) / len(grains))
+                        if self._pack_impact_mound(surface, core.x, share, hidden=hidden,
+                                                   shape_volume=powder.total_volume, reserve_volume=core.volume):
+                            if len(arrived) == len(grains):
+                                continue
+                            core.volume -= share
+                            powder.grains = tuple(grain for index, grain in enumerate(grains) if index not in arrived)
+                            core.y = baseline - surface.pile.depth_at(core.x - surface.window_left)
+                        else:
+                            # Try the next support with all the snow that has yet to settle.
+                            core.y = baseline + 0.001
+                    else:
+                        core.y = front
+            if front < bottom or any(grain.height_at(age) - grain.radius < bottom for grain in powder.grains):
+                pending.append(powder)
+        self._impact_powder = pending
+
     @staticmethod
     def _deposit_shoveled(surface: _Surface, x: float, amount: float) -> float:
         """Pack moved snow onto this visible support and return any remainder."""
@@ -948,6 +1364,114 @@ class SnowSimulation:
                               radius, vx * 0.72 + self._random.uniform(-38, 38),
                               vy + self._random.uniform(-38, 18), volume=each)
 
+    def _release_bank(self, surface: _Surface) -> None:
+        outline = self._bank_shape(surface)
+        if outline is None:
+            return
+        pile, origin = surface.pile, surface.window_left
+        step = pile.width / len(pile.depths)
+        first = max(0, floor((surface.left - origin) / step))
+        last = min(len(pile.depths), ceil((surface.right - origin) / step))
+        columns = []
+        for index in range(first, last):
+            depth = min(pile.depths[index], surface.clearance)
+            left = max(surface.left, origin + index * step)
+            right = min(surface.right, origin + (index + 1) * step)
+            if depth > 0 and left < right:
+                columns.append((left, right, depth, depth))
+        if columns:
+            height = ceil(max(column[2] for column in columns)) if pile.impact_ceiling else 0
+            self._falling_banks.append(_FallingBank(outline, columns, (outline,), surface.y, impact_height=height))
+
+    @staticmethod
+    def _settle_bank_column(surface, left, right, depth):
+        """Lay down snow across the original column width, preserving any overflow."""
+        pile, origin = surface.pile, surface.window_left
+        count = len(pile.depths) or ceil(pile.width / CELL_WIDTH)
+        step = pile.width / count
+        start, end = max(left, surface.left), min(right, surface.right)
+        first = max(0, floor((start - origin) / step))
+        last = min(count, ceil((end - origin) / step))
+        remaining = depth * (right - left)
+        if not pile.depths:
+            pile.depths = [0.0] * count
+        limit = surface.clearance
+        removed = 0.0
+        for cell in range(first, last):
+            cell_left = origin + cell * step
+            overlap = max(0.0, min(end, cell_left + step) - max(start, cell_left))
+            added = min(depth * overlap / step, max(0.0, limit - pile.depths[cell]))
+            pile.depths[cell] += added
+            removed += added * step
+        if removed > 0:
+            pile.revision += 1
+        return max(0.0, remaining - removed) / (right - left)
+
+    def _bank_candidates(self, bank: _FallingBank, old_y: float) -> list[_Surface]:
+        start = bisect_left(self._surface_ys, old_y - self._curve_reach)
+        end = bisect_right(self._surface_ys, bank.y)
+        return [surface for surface in self._surfaces[start:end]
+                if surface.left < bank.outline.right and surface.right > bank.outline.left]
+
+    def _allow_falling_mound(self, bank: _FallingBank, candidates: list[_Surface], old_y: float) -> bool:
+        expanded = False
+        for surface in candidates:
+            pile = surface.pile
+            key = id(pile)
+            if key in bank.expanded:
+                continue
+            if not any(surface.left <= (left + right) / 2 < surface.right
+                       and old_y <= surface.baseline_at((left + right) / 2) <= bank.y
+                       for left, right, _, _ in bank.columns):
+                continue
+            bank.expanded.add(key)
+            ceiling = ceil(max(pile.depths, default=0.0)) + bank.impact_height
+            if ceiling > max(pile.max_depth, pile.impact_ceiling):
+                pile.impact_ceiling = ceiling
+                expanded = True
+        return expanded
+
+    def _advance_banks(self, dt: float) -> None:
+        falling = []
+        bottom = self._desktop_bounds[2]
+        for bank in self._falling_banks:
+            old_y = bank.y
+            bank.y += (bank.speed + 380 * dt) * dt
+            bank.speed = min(880, bank.speed + 760 * dt)
+            candidates = self._bank_candidates(bank, old_y)
+            if bank.impact_height and self._allow_falling_mound(bank, candidates, old_y):
+                self._rebuild_surfaces()
+                candidates = self._bank_candidates(bank, old_y)
+            if candidates:
+                columns = []
+                for left, right, depth, original in bank.columns:
+                    x = (left + right) / 2
+                    contacts = []
+                    for surface in candidates:
+                        if not surface.left <= x < surface.right:
+                            continue
+                        y = surface.baseline_at(x)
+                        if not old_y <= y <= bank.y:
+                            continue
+                        if surface.platform and any(
+                            x1 <= x < x2 and y1 < y <= y2 for _, x1, y1, x2, y2 in self._windows
+                        ):
+                            continue
+                        contacts.append((y, surface))
+                    for _, surface in sorted(contacts, key=itemgetter(0)):
+                        depth = self._settle_bank_column(surface, left, right, depth)
+                        if depth <= 1e-9:
+                            break
+                    if depth > 1e-9:
+                        columns.append((left, right, depth, original))
+                if columns != bank.columns:
+                    bank.columns = columns
+                    if columns:
+                        bank.trim()
+            if bank.columns and bank.y + bank.outline.top - bank.outline.bottom < bottom:
+                falling.append(bank)
+        self._falling_banks = falling
+
     def _spawn(self, count: int, *, initial: bool = False) -> None:
         rng = self._random
         count = min(count, MAX_FLAKES - len(self.particles))
@@ -978,7 +1502,7 @@ class SnowSimulation:
         else:
             # A fast clump can cross several bands.
             first = bisect_left(self._surface_ys, old_base - self._curve_reach)
-            last = bisect_right(self._surface_ys, new_base + GROUND_DEPTH)
+            last = bisect_right(self._surface_ys, new_base + self._max_clearance)
             candidates = self._surfaces[first:last]
         if not candidates:
             return None
@@ -1041,6 +1565,10 @@ class SnowSimulation:
         if dt <= 0 or intensity <= 0 or not self._monitors:
             return
         dt = min(dt, 0.12)
+        if self._falling_banks:
+            self._advance_banks(dt)
+        if self._impact_powder:
+            self._advance_impact_powder(dt)
         self._time += dt
         rate = min(190, 120 * min(intensity, 1.0) ** 1.25 * sum(self._monitor_weights) / 1920)
         if self._needs_seed:
@@ -1110,14 +1638,26 @@ class SnowSimulation:
     def drifts(self) -> Iterator[DriftPolygon]:
         """Yield each cached bank. Its HWND is zero for ground and taskbar snow."""
         for surface in self._surfaces:
-            if surface.drawn_revision != surface.pile.revision:
-                depths = surface.visible_depths()
-                if depths != surface.rendered_depths:
-                    surface.shape = self._drift_polygon(surface, depths, surface.rendered_depths)
-                    surface.rendered_depths = depths
-                surface.drawn_revision = surface.pile.revision
-            if surface.shape:
-                yield surface.shape
+            shape = self._bank_shape(surface)
+            if shape:
+                yield shape
+
+    def _bank_shape(self, surface: _Surface) -> DriftPolygon | None:
+        if surface.drawn_revision != surface.pile.revision:
+            depths = surface.visible_depths()
+            if depths != surface.rendered_depths:
+                surface.shape = self._drift_polygon(surface, depths, surface.rendered_depths)
+                surface.rendered_depths = depths
+            surface.drawn_revision = surface.pile.revision
+        return surface.shape
+
+    def falling_drifts(self) -> Iterator[DriftPolygon]:
+        """Translate each released outline vertically without changing its profile."""
+        for bank in self._falling_banks:
+            offset = round(bank.y - bank.outline.bottom)
+            for shape in bank.shapes:
+                yield DriftPolygon(((x, y + offset) for x, y in shape),
+                                   0, shape.left, shape.right, False)
 
     def bank_at(self, x: float, y: float, margin: float = 1.25, *, hwnd: int | None = None,
                 visible: Visibility | None = None) -> bool:

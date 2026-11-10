@@ -33,7 +33,7 @@ class SnowShovel:
         if not self.dragging:
             return None
         x, y = self.pointer
-        support = snow.support_at(x, y, 52, hwnd=self.owner, visible=visible)
+        support = snow.support_at(x, y, 52, hwnd=self.owner, visible=visible, within_snow=True)
         if support is None:
             return None
         return x, min(y + 6, support[3]), self.direction

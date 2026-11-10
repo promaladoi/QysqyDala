@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from math import ceil, hypot, sqrt
 
-from simulation import MAX_FLAKES
+from simulation import ImpactPose, MAX_FLAKES
 
 MAX_RADIUS = 36.0
 MAX_VOLUME = MAX_RADIUS ** 2
@@ -15,10 +15,10 @@ STACK_HEIGHTS = tuple(1.8 * sum(STACK_RADII[:index]) + 2 * ratio
 MAX_LAYERS = len(STACK_RADII)
 MAX_BALLS = MAX_STACKS * MAX_LAYERS
 SUPPORT_REACH = 52
+FIGURE_PLACE_REACH = 6
 PICKUP_VOLUME = 12.0
 GRAVITY = 760.0
 SHATTER_SPEED = 745.0
-MAX_IMPACT_FRAGMENTS = 8
 ROLL_FRICTION = 145.0
 SETTLE_SPEED = 11.0
 FLICK_WINDOW = 0.12
@@ -64,7 +64,7 @@ def _swept_circle(dx, dy, separation_x, separation_y, radius):
 class Snowman:
     hwnd: int
     x: float
-    y: int
+    y: float
     window: tuple[int, int, int, int] | None
     volumes: list[float]
 
@@ -114,6 +114,41 @@ class _MovingBall:
         self.radius = _radius(self.volume)
 
 
+@dataclass(slots=True, eq=False)
+class _FlyingFigure:
+    figure: Snowman
+    vx: float
+    vy: float
+    thrown: bool = False
+
+
+@dataclass(slots=True)
+class _Impact:
+    target: Snowman | _MovingBall | _FlyingFigure
+    time: float
+    x: float
+    y: float
+    nx: float
+    ny: float
+    speed: float
+    owner: int
+    hard: bool
+    poses: tuple[ImpactPose, ImpactPose]
+
+
+def _impact_radii(body):
+    if isinstance(body, _MovingBall):
+        return (body.radius,)
+    figure = body.figure if isinstance(body, _FlyingFigure) else body
+    return figure.radii
+
+
+def _impact_layers(body, baseline):
+    for radius in _impact_radii(body):
+        yield baseline - radius, radius
+        baseline -= 1.8 * radius
+
+
 class Snowmen:
     def __init__(self):
         self.enabled = False
@@ -122,6 +157,7 @@ class Snowmen:
     def clear(self):
         self.items = []
         self.moving = []
+        self.flying = []
         self.held = 0.0
         self.held_figure = None
         self._figure_offset = None
@@ -140,6 +176,10 @@ class Snowmen:
         return self.dragging and self.held_figure is not None
 
     @property
+    def visible_flight(self):
+        return bool(self.flying) or any(ball.thrown for ball in self.moving)
+
+    @property
     def loose_radius(self):
         return _radius(self.held)
 
@@ -149,7 +189,7 @@ class Snowmen:
         dt = min(0.1, max(0.0, dt))
         if dt:
             self._drag_dt = min(1 / 30, max(1 / 120, dt))
-        if not (self.items or self.moving or self.held_figure is not None) and (
+        if not (self.items or self.moving or self.flying or self.held_figure is not None) and (
                 not self.held or self.dragging or self.last_ledge is None):
             return
         snapshot = tuple(windows)
@@ -165,30 +205,27 @@ class Snowmen:
                 dx, dy = motion
                 vx = min(130.0, max(-130.0, -dx * 4.5))
                 vy = min(-25.0, max(-90.0, dy * 2.0 - 30.0))
-                self._detach(figure, vx, vy)
+                if len(figure.volumes) > 1:
+                    self.flying.append(_FlyingFigure(figure, vx, vy))
+                else:
+                    self._detach(figure, vx, vy)
         self.items = supported
-        if dt and self.moving:
+        if dt and (self.moving or self.flying):
             pieces = min(4, ceil(dt * 60))
+            interval = dt / pieces
             for _ in range(pieces):
-                self._advance(snow, dt / pieces, visible)
+                if self.moving or self.flying:
+                    self._advance(snow, interval, visible)
         if self.held_figure is not None and not self.dragging:
             self._restore_figure(snow, self._positions)
         if self.held and not self.dragging:
             self._park(snow, self._positions)
 
     def _detach(self, figure, vx, vy, *, rolling=False):
-        bottom = figure.y
-        base = None
-        for index, (volume, displayed) in enumerate(zip(figure.volumes, figure.radii)):
-            on_ledge = rolling and index == 0
-            ball = _MovingBall(figure.x, bottom - displayed + _radius(volume), volume,
-                               figure.hwnd, vx if index == 0 else vx + (index - 1) * 22,
-                               0.0 if on_ledge else vy - index * 9, on_ledge)
-            if base is None:
-                base = ball
-            self.moving.append(ball)
-            bottom -= displayed * 1.8
-        return base
+        ball = _MovingBall(figure.x, figure.y, figure.volumes[0], figure.hwnd,
+                           vx, 0.0 if rolling else vy, rolling)
+        self.moving.append(ball)
+        return ball
 
     @staticmethod
     def _contact_distance(x, center_y, radius, other_x, other_y, other_radius, direction, travel):
@@ -225,19 +262,22 @@ class Snowmen:
         return nearest, direction * distance
 
     def _advance(self, snow, dt, visible):
-        balls = tuple(self.moving)
+        balls, flights = tuple(self.moving), tuple(self.flying)
         motion = None
-        if any(ball.thrown for ball in balls):
+        if flights or any(ball.thrown or abs(ball.vx) + abs(ball.vy) >= THROW_SHATTER_SPEED / 2
+                          for ball in balls):
             # Take one snapshot so a moving target's path is independent of update order.
             motion = {ball: (ball.x, ball.y, ball.vx, ball.vy, ball.rolling) for ball in balls}
-        broken = set() if motion is not None else ()
+            motion.update((flight, (flight.figure.x, flight.figure.y, flight.vx, flight.vy, False))
+                          for flight in flights)
+        broken = set()
         for ball in balls:
             if ball in broken:
                 continue
             ball.age += dt
-            if ball.rolling:
-                self._roll(snow, ball, dt)
-            elif self._fall(snow, ball, dt, motion, broken, visible):
+            removed = (self._roll(snow, ball, dt, broken, visible) if ball.rolling
+                       else self._fall(snow, ball, dt, motion, broken, visible))
+            if removed:
                 self.moving.remove(ball)
                 continue
             if ball.rolling and abs(ball.vx) < SETTLE_SPEED:
@@ -250,8 +290,11 @@ class Snowmen:
                 snow.release_ball(ball.x, ball.y - ball.radius, ball.radius,
                                   ball.vx, ball.vy, volume=ball.volume)
                 self.moving.remove(ball)
+        for flight in flights:
+            if flight not in broken and self._advance_figure(snow, flight, dt, motion, broken, visible):
+                self.flying.remove(flight)
 
-    def _roll(self, snow, ball, dt):
+    def _roll(self, snow, ball, dt, broken, visible):
         if not ball.vx:
             return
         if ball.owner == 0:
@@ -265,10 +308,23 @@ class Snowmen:
         target, dx = self._rolling_hit(ball, direction * (speed + slowed) * travel_time / 2)
         ball.vx = direction * slowed
         if target is not None:
+            target_vx = target.vx if isinstance(target, _MovingBall) else 0.0
+            relative = ball.vx - target_vx
+            contact_x = ball.x + dx + direction * ball.radius
+            if abs(relative) >= THROW_SHATTER_SPEED and (
+                    visible is None or visible(ball.owner, contact_x, ball.y - ball.radius)):
+                poses = ((ball.x + dx, ball.y, ball.radius),
+                         (target.x, target.y, *_impact_radii(target)))
+                if self._merge_impact(snow, contact_x, ball.y - ball.radius,
+                                      ball.volume, target, broken, poses):
+                    return True
+            if isinstance(target, Snowman) and len(target.volumes) > 1:
+                ball.vx *= -0.45
+                ball.x += dx
+                return False
             if isinstance(target, Snowman):
                 self.items.remove(target)
                 target = self._detach(target, 0.0, -24.0, rolling=True)
-            relative = ball.vx - target.vx
             impulse = 1.22 * relative / (ball.volume + target.volume)
             ball.vx -= impulse * target.volume
             target.vx += impulse * ball.volume
@@ -284,19 +340,26 @@ class Snowmen:
     def _fall(self, snow, ball, dt, motion, broken, visible):
         x = ball.x + ball.vx * dt
         y = ball.y + (ball.vy + 0.5 * GRAVITY * dt) * dt
-        landing = snow.ball_landing(ball.x, ball.y, x, y) if y >= ball.y else None
-        if ball.thrown:
+        landing = snow.ball_landing(ball.x, ball.y, x, y)
+        if motion is not None:
             limit = (landing.y - ball.y) / (y - ball.y) if landing is not None else 1.0
-            hit = self._throw_contact(snow, ball, x, y, dt, limit, motion, visible)
+            hit = self._impact_contact(snow, ball, ball.x, ball.y, x, y, dt, limit,
+                                       motion, visible, hard_only=not ball.thrown)
             if hit is not None:
-                return self._hit_thrown_ball(snow, ball, x, y, dt, hit, broken)
+                if (hit.hard and self._merge_impact(
+                        snow, hit.x, hit.y, ball.volume, hit.target, broken, hit.poses)):
+                    return True
+                if ball.thrown:
+                    self._bounce_ball(ball, x, y, dt, hit)
+                    return False
         if landing is not None:
             owner, impact_x, impact_y = landing
             # Use the velocity at first contact, before the end of the frame.
             speed_squared = ball.vy ** 2 + 2 * GRAVITY * (impact_y - ball.y)
-            if speed_squared >= SHATTER_SPEED ** 2:
-                if self._shatter(snow, ball, impact_x, impact_y, sqrt(speed_squared)):
-                    return True
+            if (speed_squared >= SHATTER_SPEED ** 2
+                    and snow.deposit_impact_mound(impact_x, impact_y, ball.volume, hwnd=owner,
+                                                   poses=((impact_x, impact_y, ball.radius),))):
+                return True
             ball.owner, ball.x, ball.y = owner, impact_x, impact_y
             ball.vx *= 0.73
             ball.vy, ball.rolling = 0.0, True
@@ -307,120 +370,143 @@ class Snowmen:
             ball.vx *= 1 - 0.16 * dt
         return False
 
-    def _throw_contact(self, snow, ball, x, y, dt, limit, motion, visible):
-        dx, dy = x - ball.x, y - ball.y
-        center_y = ball.y - ball.radius
-        nearest = None
-        margin = ball.radius + MAX_RADIUS
-        left, right = min(ball.x, x) - margin, max(ball.x, x) + margin
-        top, bottom = min(center_y, y - ball.radius) - margin, max(center_y, y - ball.radius) + margin
+    def _advance_figure(self, snow, flight, dt, motion, broken, visible):
+        figure = flight.figure
+        radius = figure.radii[0]
+        x = figure.x + flight.vx * dt
+        y = figure.y + (flight.vy + 0.5 * GRAVITY * dt) * dt
+        landing = snow.ball_landing(figure.x, figure.y, x, y)
+        limit = (landing.y - figure.y) / (y - figure.y) if landing is not None else 1.0
+        hit = self._impact_contact(snow, flight, figure.x, figure.y, x, y, dt, limit,
+                                   motion, visible, hard_only=True)
+        volume = sum(figure.volumes)
+        if hit is not None and self._merge_impact(snow, hit.x, hit.y, volume, hit.target, broken, hit.poses):
+            return True
+        if landing is not None:
+            owner, impact_x, impact_y = landing
+            speed_squared = flight.vy ** 2 + 2 * GRAVITY * (impact_y - figure.y)
+            support = snow.support_at(impact_x, impact_y, 2, hwnd=owner)
+            if speed_squared < SHATTER_SPEED ** 2 and support is not None:
+                location = self._free_position(impact_x, impact_y, support[1], support[2], radius, owner)
+                if location is not None and abs(location - impact_x) <= radius:
+                    baseline = snow.ground_y_at(location, impact_y) if owner == 0 else impact_y
+                    figure.hwnd, figure.x = owner, location
+                    figure.y, figure.window = baseline, self._positions.get(owner)
+                    self.items.append(figure)
+                    return True
+            if snow.deposit_impact_mound(impact_x, impact_y, volume, hwnd=owner,
+                                         poses=((impact_x, impact_y, *figure.radii),)):
+                return True
+        figure.x, figure.y = x, y
+        flight.vy = min(880.0, flight.vy + GRAVITY * dt)
+        flight.vx *= 1 - 0.16 * dt
+        return snow.ball_outside(x, figure.crown + 2 * radius, radius)
 
-        def consider(target, part, owner, target_x, target_y, radius, drift_x=0.0, drift_y=0.0):
+    def _impact_contact(self, snow, body, old_x, old_y, x, y, dt, limit, motion, visible, *, hard_only):
+        dx, dy = x - old_x, y - old_y
+        layers = tuple(_impact_layers(body, old_y))
+        margin = layers[0][1] + MAX_RADIUS
+        left, right = min(old_x, x) - margin, max(old_x, x) + margin
+        top = layers[-1][0] - layers[-1][1] + min(0.0, dy) - MAX_RADIUS
+        bottom = old_y + max(0.0, dy) + MAX_RADIUS
+        nearest = None
+
+        def consider(target, owner, tx, ty, vx, vy, rolling, airborne):
             nonlocal nearest, limit
-            if min(target_y, target_y + drift_y) > bottom or max(target_y, target_y + drift_y) < top:
+            drift_x = vx * dt
+            if min(tx, tx + drift_x) > right or max(tx, tx + drift_x) < left:
                 return
-            time = _swept_circle(dx - drift_x, dy - drift_y, target_x - ball.x,
-                                 target_y - center_y, ball.radius + radius)
-            if time is None or time > limit:
-                return
-            if nearest is not None and time == limit and snow.owner_rank(owner) >= snow.owner_rank(nearest[5]):
-                return
-            target_x += drift_x * time
-            target_y += drift_y * time
-            if visible is not None:
-                center_x = ball.x + dx * time
-                contact_y = center_y + dy * time
-                distance = hypot(target_x - center_x, target_y - contact_y)
-                edge = ball.radius / distance if distance else 0
-                contact_x = center_x + (target_x - center_x) * edge
-                contact_y += (target_y - contact_y) * edge
-                if not visible(owner, contact_x, contact_y):
-                    return
-            limit = time
-            nearest = target, part, time, target_x, target_y, owner
+            drift_y = 0.0 if rolling else (vy + 0.5 * GRAVITY * dt) * dt
+            target_limit = limit
+            if drift_y > 0:
+                landing = snow.ball_landing(tx, ty, tx + drift_x, ty + drift_y)
+                if landing is not None:
+                    target_limit = min(target_limit, (landing.y - ty) / drift_y)
+            for target_y, target_radius in _impact_layers(target, ty):
+                if min(target_y, target_y + drift_y) > bottom or max(target_y, target_y + drift_y) < top:
+                    continue
+                for center_y, radius in layers:
+                    time = _swept_circle(dx - drift_x, dy - drift_y, tx - old_x,
+                                         target_y - center_y, radius + target_radius)
+                    if time is None or time > min(limit, target_limit):
+                        continue
+                    if nearest is not None and time == limit and snow.owner_rank(owner) >= snow.owner_rank(nearest.owner):
+                        continue
+                    nx = tx - old_x + (drift_x - dx) * time
+                    ny = target_y - center_y + (drift_y - dy) * time
+                    distance = hypot(nx, ny)
+                    if not distance:
+                        continue
+                    nx, ny = nx / distance, ny / distance
+                    gravity = GRAVITY * dt * time
+                    source_vy = min(880.0, body.vy + gravity)
+                    target_vy = vy if rolling else min(880.0, vy + gravity)
+                    speed = (body.vx - vx) * nx + (source_vy - target_vy) * ny
+                    hard = (speed >= THROW_SHATTER_SPEED or body.thrown
+                            or getattr(target, "thrown", False))
+                    if speed <= 0 or (hard_only and not hard):
+                        continue
+                    cx = old_x + dx * time + radius * nx
+                    cy = center_y + dy * time + radius * ny
+                    if not airborne and visible is not None and not visible(owner, cx, cy):
+                        continue
+                    limit = time
+                    poses = ((old_x + dx * time, old_y + dy * time, *_impact_radii(body)),
+                             (tx + drift_x * time, ty + drift_y * time, *_impact_radii(target)))
+                    nearest = _Impact(target, time, cx, cy, nx, ny, speed, owner, hard, poses)
 
         for figure in self.items:
-            if not left <= figure.x <= right or figure.y < top or figure.crown > bottom:
-                continue
-            baseline = figure.y
-            for part, radius in enumerate(figure.radii):
-                consider(figure, part, figure.hwnd, figure.x, baseline - radius, radius)
-                baseline -= radius * 1.8
+            if left <= figure.x <= right and figure.y >= top and figure.crown <= bottom:
+                consider(figure, figure.hwnd, figure.x, figure.y, 0.0, 0.0, True, False)
         for target in self.moving:
-            if target is ball:
+            if target is body:
                 continue
             state = motion.get(target)
             if state is None:
                 state = target.x, target.y, target.vx, target.vy, target.rolling
-            target_x, target_y, vx, vy, rolling = state
-            drift_x = vx * dt
-            if min(target_x, target_x + drift_x) > right or max(target_x, target_x + drift_x) < left:
-                continue
-            drift_y = 0.0 if rolling else (vy + 0.5 * GRAVITY * dt) * dt
             owner = target.owner if target.owner in self._positions else 0
-            consider(target, 0, owner, target_x, target_y - target.radius, target.radius, drift_x, drift_y)
+            consider(target, owner, *state, target.thrown)
+        for target in self.flying:
+            if target is not body:
+                consider(target, 0, *motion[target], True)
         return nearest
 
-    def _hit_thrown_ball(self, snow, ball, x, y, dt, hit, broken):
-        target, part, time, target_x, target_y, _ = hit
-        ball.x += (x - ball.x) * time
-        ball.y += (y - ball.y) * time
-        ball.vy = min(880.0, ball.vy + GRAVITY * dt * time)
-        nx, ny = target_x - ball.x, target_y - (ball.y - ball.radius)
-        distance = hypot(nx, ny)
-        if not distance:
+    def _merge_impact(self, snow, x, y, volume, target, broken, poses):
+        if isinstance(target, _MovingBall):
+            objects, target_volume = self.moving, target.volume
+        elif isinstance(target, _FlyingFigure):
+            objects, target_volume = self.flying, sum(target.figure.volumes)
+        else:
+            objects, target_volume = self.items, sum(target.volumes)
+        if not snow.deposit_impact_mound(x, y, volume + target_volume, poses=poses):
             return False
-        nx, ny = nx / distance, ny / distance
-        resting = isinstance(target, Snowman)
-        target_vx = 0.0 if resting else target.vx
-        target_vy = 0.0 if resting else target.vy
-        speed = (ball.vx - target_vx) * nx + (ball.vy - target_vy) * ny
-        if speed <= 0:
-            return False
-        if resting:
+        objects.remove(target)
+        broken.add(target)
+        return True
+
+    def _bounce_ball(self, ball, x, y, dt, hit):
+        ball.x += (x - ball.x) * hit.time - hit.nx * 0.05
+        ball.y += (y - ball.y) * hit.time - hit.ny * 0.05
+        ball.vy = min(880.0, ball.vy + GRAVITY * dt * hit.time)
+        target = hit.target
+        if isinstance(target, Snowman) and len(target.volumes) > 1:
+            ball.vx -= 1.22 * hit.speed * hit.nx
+            ball.vy -= 1.22 * hit.speed * hit.ny
+            return
+        if isinstance(target, Snowman):
             self.items.remove(target)
-            offset = len(self.moving) + part
-            self._detach(target, 0.0, -24.0, rolling=True)
-            target = self.moving[offset]
-        impulse = 1.22 * speed / (ball.volume + target.volume)
-        ball.vx -= impulse * target.volume * nx
-        ball.vy -= impulse * target.volume * ny
-        target.vx += impulse * ball.volume * nx
-        target.vy += impulse * ball.volume * ny
-        if target.rolling:
+            target = self._detach(target, 0.0, -24.0, rolling=True)
+        mass = target.volume if isinstance(target, _MovingBall) else sum(target.figure.volumes)
+        impulse = 1.22 * hit.speed / (ball.volume + mass)
+        ball.vx -= impulse * mass * hit.nx
+        ball.vy -= impulse * mass * hit.ny
+        target.vx += impulse * ball.volume * hit.nx
+        target.vy += impulse * ball.volume * hit.ny
+        if isinstance(target, _MovingBall) and target.rolling:
             if target.vy < -SETTLE_SPEED:
                 target.rolling = False
             else:
                 target.vy = 0.0
-        available = MAX_FLAKES - len(snow.particles)
-        if speed >= THROW_SHATTER_SPEED and available >= 4:
-            # Leave two fragment slots for the target even when the weather is full.
-            self._shatter(snow, ball, ball.x, ball.y, speed, budget=available - 2)
-            self._shatter(snow, target, target_x, target_y + target.radius, speed)
-            self.moving.remove(target)
-            broken.add(target)
-            return True
-        ball.x -= nx * 0.05
-        ball.y -= ny * 0.05
-        return False
-
-    @staticmethod
-    def _shatter(snow, ball, x, y, speed, *, budget=MAX_IMPACT_FRAGMENTS):
-        count = min(MAX_FLAKES - len(snow.particles), MAX_IMPACT_FRAGMENTS, budget,
-                    max(3, ceil(ball.radius / 5)))
-        if count < 2:
-            return False
-        portion = ball.volume / count
-        radius = min(4.8, max(1.05, 0.33 * sqrt(portion)))
-        for index in range(count):
-            spread = 2 * index / (count - 1) - 1
-            volume = portion if index < count - 1 else ball.volume - portion * (count - 1)
-            snow.release_ball(
-                x + spread * ball.radius * 0.40, y - radius - max(1, ball.radius * 0.25),
-                radius, ball.vx * 0.4 + spread * (75 + speed * 0.20),
-                -(55 + speed * 0.10) * (1 - 0.45 * abs(spread)), volume=volume,
-            )
-        return True
 
     def _settle(self, snow, ball):
         support = snow.support_at(ball.x, ball.y, 2, hwnd=ball.owner)
@@ -440,7 +526,7 @@ class Snowmen:
         return True
 
     def _remember_ledge(self, snow, x, y, *, hwnd=None, visible=None):
-        support = snow.support_at(x, y, SUPPORT_REACH, hwnd=hwnd, visible=visible)
+        support = snow.support_at(x, y, SUPPORT_REACH, hwnd=hwnd, visible=visible, within_snow=True)
         if support is not None:
             self.last_ledge = (x, support[3], support[0])
 
@@ -463,7 +549,7 @@ class Snowmen:
             self._harvest(snow, x, y, brush=10.0, quota=PICKUP_VOLUME, hwnd=bank, visible=visible)
         else:
             return False
-        if self.held_figure is None and now is not None:
+        if now is not None:
             self._flick_samples = [(now, x, y)]
         self.pointer = self.last_sample = (x, y)
         return True
@@ -508,8 +594,6 @@ class Snowmen:
                 self._flick_rest = now
             return
         self.pointer = (x, y)
-        if self.held_figure is not None:
-            return
         if samples is not None and now is not None and now > samples[-1][0]:
             if self._flick_rest is not None and samples[-1][0] < self._flick_rest < now:
                 samples.append((self._flick_rest, *previous))
@@ -517,6 +601,8 @@ class Snowmen:
             if len(samples) > 9:
                 del samples[:-9]
         self._flick_rest = None
+        if self.held_figure is not None:
+            return
         self._remember_ledge(snow, x, y, visible=visible)
         start_x, start_y = self.last_sample
         dx, dy = x - start_x, y - start_y
@@ -576,7 +662,10 @@ class Snowmen:
         velocity = direction * push * (0.5 + 0.5 * min(1.0, self.held / mass))
         if isinstance(nearest, Snowman):
             self.items.remove(nearest)
-            self._detach(nearest, velocity, -24.0, rolling=True)
+            if len(nearest.volumes) > 1:
+                self.flying.append(_FlyingFigure(nearest, velocity, -24.0))
+            else:
+                self._detach(nearest, velocity, -24.0, rolling=True)
         elif nearest.vx * direction < abs(velocity):
             nearest.vx = velocity
 
@@ -586,8 +675,18 @@ class Snowmen:
         positions = {window[0]: window[1:] for window in windows}
         if self.held_figure is not None:
             if allow_drop and self.enabled:
+                self.move_drag(snow, x, y, visible=visible, now=now)
                 base_x, baseline = self._figure_anchor(x, y)
-                self._drop_figure(snow, positions, base_x, baseline, visible)
+                self._drop_figure(snow, positions, base_x, baseline, y, visible)
+                if self.held_figure is not None:
+                    figure = self.held_figure
+                    self.held_figure = None
+                    ground = snow.ground_y_at(base_x, baseline)
+                    figure.x = base_x
+                    figure.y = min(baseline, ground) if ground is not None else baseline
+                    velocity = self._flick_velocity(now)
+                    vx, vy = velocity or (0.0, 0.0)
+                    self.flying.append(_FlyingFigure(figure, vx, vy, thrown=velocity is not None))
             self.cancel_drag()
             if self.held_figure is not None:
                 self._restore_figure(snow, positions, visible)
@@ -620,6 +719,14 @@ class Snowmen:
         self._flick_samples = None
         self._flick_rest = None
 
+    def release_to_plow(self):
+        volume = self.held if self.held_figure is None else sum(self.held_figure.volumes)
+        self.held = 0.0
+        self.held_figure = None
+        self.last_ledge = None
+        self.cancel_drag()
+        return volume
+
     def _flick_velocity(self, now):
         samples = self._flick_samples
         if now is None or not samples or len(samples) < 2:
@@ -647,22 +754,18 @@ class Snowmen:
         dx, dy = self._figure_offset
         return x + dx, y + dy
 
-    def _drop_figure(self, snow, positions, x, y, visible):
+    def _drop_figure(self, snow, positions, x, y, cursor_y, visible):
         radius = _radius(self.held_figure.volumes[0])
-
-        def can_hold(owner, base_x, baseline):
-            support = snow.support_at(base_x, baseline, SUPPORT_REACH, hwnd=owner)
-            if support is None:
-                return False
-            _, left, right, ledge = support
-            return (left + radius <= base_x <= right - radius
-                    and (visible is None or visible(owner, base_x, ledge - 1)))
-
-        support = snow.support_at(x, y, SUPPORT_REACH, visible=can_hold)
+        # A base held from its centre may sit slightly through the ledge.
+        # Release above the ledge otherwise requires actual proximity to it.
+        reach = max(FIGURE_PLACE_REACH, y - cursor_y)
+        support = snow.support_at(x, y, reach)
         if support is None:
             return
         owner, left, right, ledge = support
-        if not left + radius <= x <= right - radius or not self._position_is_clear(x, ledge, radius, owner):
+        if (ledge - y > FIGURE_PLACE_REACH or not left + radius <= x <= right - radius
+                or (visible is not None and not visible(owner, x, ledge - 1))
+                or not self._position_is_clear(x, ledge, radius, owner)):
             return
         self._put_figure(owner, x, ledge, positions)
 
@@ -777,7 +880,8 @@ class Snowmen:
         return True
 
     def _ball_count(self):
-        return len(self.moving) + sum(len(figure.volumes) for figure in self.items)
+        return (len(self.moving) + sum(len(figure.volumes) for figure in self.items)
+                + sum(len(flight.figure.volumes) for flight in self.flying))
 
     def _park(self, snow, positions):
         if self.last_ledge is None:
@@ -855,6 +959,33 @@ class Snowmen:
         candidate = max(cursor, desired)
         return candidate if abs(candidate - desired) < distance else best
 
+    def collect_desktop_figures(self, snow, screen, left, right, *, blade_lift=0.0,
+                                panel_gap=None, visible=None):
+        """Collect props touched by the blade on the floor or raised taskbar."""
+        def touches(x, y, radius, height):
+            if x + radius < left or x - radius >= right:
+                return False
+            if height > blade_lift and snow.on_desktop_floor(screen, x, y):
+                return True
+            return (panel_gap is not None and snow.on_taskbar_platform(
+                screen, x, y, blade_lift, panel_gap, height=height)
+                and (visible is None or visible(0, x, y - radius)))
+
+        hits = []
+        for figure in tuple(self.items):
+            if figure.hwnd != 0 or figure.window is not None:
+                continue
+            radius = _radius(figure.volumes[0])
+            if touches(figure.x, figure.y, radius, figure.y - figure.crown):
+                self.items.remove(figure)
+                hits.append((figure.x, figure.y - radius, radius, sum(figure.volumes)))
+        for ball in tuple(self.moving):
+            if (ball.owner == 0 and ball.rolling
+                    and touches(ball.x, ball.y, ball.radius, 2 * ball.radius)):
+                self.moving.remove(ball)
+                hits.append((ball.x, ball.y - ball.radius, ball.radius, ball.volume))
+        return hits
+
     def scene(self):
         return tuple((figure.x, figure.y, *figure.radii) for figure in self.items)
 
@@ -862,11 +993,12 @@ class Snowmen:
         return tuple(figure.hwnd for figure in self.items)
 
     def moving_scene(self):
-        return tuple((ball.x, ball.y, ball.radius) for ball in self.moving)
+        return (tuple((ball.x, ball.y, ball.radius) for ball in self.moving)
+                + tuple((flight.figure.x, flight.figure.y, *flight.figure.radii) for flight in self.flying))
 
     def moving_scene_owners(self):
-        return tuple(FLYING_BALL_LAYER if ball.thrown else ball.owner if ball.owner in self._positions else 0
-                     for ball in self.moving)
+        return (tuple(FLYING_BALL_LAYER if ball.thrown else ball.owner if ball.owner in self._positions else 0
+                      for ball in self.moving) + (FLYING_BALL_LAYER,) * len(self.flying))
 
     def drag_owner(self, snow, visible):
         if self.pointer is None:

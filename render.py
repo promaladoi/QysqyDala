@@ -5,10 +5,11 @@ from array import array
 from collections import OrderedDict
 from ctypes import wintypes as wt
 from itertools import chain
-from math import ceil, floor
+from math import ceil, cos, floor, sin
 
 from simulation import DriftPolygon
 from snowman import FLYING_BALL_LAYER
+from snowplow import PLOW_SCALE, SCOOP_EDGE, VEHICLE_HEIGHT, VEHICLE_LENGTH
 from win32 import LOAD_LIBRARY_SEARCH_SYSTEM32, Overlay, bind
 
 gdiplus = ct.WinDLL("gdiplus", winmode=LOAD_LIBRARY_SEARCH_SYSTEM32)
@@ -44,6 +45,8 @@ delete_graphics = bind(gdiplus, "GdipDeleteGraphics", ct.c_int, Handle)
 set_smoothing = bind(gdiplus, "GdipSetSmoothingMode", ct.c_int, Handle, ct.c_int)
 translate_graphics = bind(gdiplus, "GdipTranslateWorldTransform", ct.c_int, Handle,
                           ct.c_float, ct.c_float, ct.c_int)
+scale_graphics = bind(gdiplus, "GdipScaleWorldTransform", ct.c_int, Handle,
+                      ct.c_float, ct.c_float, ct.c_int)
 create_region = bind(gdiplus, "GdipCreateRegionRectI", ct.c_int, ct.POINTER(RectI), HandleOut)
 clone_region = bind(gdiplus, "GdipCloneRegion", ct.c_int, Handle, HandleOut)
 delete_region = bind(gdiplus, "GdipDeleteRegion", ct.c_int, Handle)
@@ -67,6 +70,9 @@ draw_bitmap = bind(gdiplus, "GdipDrawImageRectRectI", ct.c_int, Handle, Handle,
                    ct.c_int, ct.c_int, ct.c_int, ct.c_int,
                    ct.c_int, ct.c_int, ct.c_int, ct.c_int, ct.c_int,
                    Handle, Handle, Handle)
+draw_bitmap_points = bind(gdiplus, "GdipDrawImagePointsRect", ct.c_int, Handle, Handle,
+                          ct.POINTER(PointF), ct.c_int, ct.c_float, ct.c_float,
+                          ct.c_float, ct.c_float, ct.c_int, Handle, Handle, Handle)
 
 PIXEL_FORMAT_32BPP_PARGB = 0x000E200B
 UNIT_PIXEL = 2
@@ -138,6 +144,68 @@ SHOVEL_SHAPES = (
     (SHOVEL_BLADE, ((-8, -11), (3, -10), (10, -7), (11, -5), (9, -2),
                     (-6, -2), (-8, -4), (-9, -9))),
     (SHOVEL_EDGE, ((-6, -4), (10, -4), (8, -2), (-5, -2))),
+)
+
+PLOW_FILL_STEPS = 16
+PLOW_INK = 0xFF162536
+PLOW_WHITE = 0xFFF1F7FC
+PLOW_CYAN = 0xFF44DBEA
+PLOW_SHELL = (
+    # Chassis and the open, rear-mounted hopper.
+    (PLOW_INK, ((8, 42), (91, 43), (94, 51), (90, 58), (9, 58), (6, 53))),
+    (0xFF1C7486, ((0, 27), (6, 20), (41, 20), (45, 25), (39, 43), (12, 47), (3, 37))),
+    (0xFF31B7C9, ((1, 30), (41, 30), (38, 41), (23, 41), (13, 45), (5, 37))),
+    (0xFF75E1E9, ((5, 30), (7, 30), (16, 43), (14, 44))),
+    (PLOW_WHITE, ((0, 29), (3, 23), (8, 19), (39, 19), (44, 22), (43, 29))),
+    (0xFF597D91, ((4, 25), (8, 21), (38, 21), (41, 23), (39, 26), (6, 26))),
+    (0xFFA8EAF0, ((0, 29), (43, 29), (42, 31), (1, 31))),
+    # White fenders and the swept, dark-glass cab.
+    (0xFF8196AA, ((9, 46), (17, 39), (30, 38), (36, 36), (42, 13), (46, 8), (52, 6),
+                  (70, 6), (76, 9), (83, 17), (89, 29), (92, 38), (92, 49),
+                  (85, 54), (80, 54), (76, 48), (72, 45), (66, 45), (60, 49), (57, 54),
+                  (36, 54), (32, 48), (27, 45), (21, 45), (16, 48), (13, 54), (8, 52))),
+    (PLOW_WHITE, ((10, 45), (17, 39), (31, 39), (37, 36), (42, 14), (46, 8), (52, 6),
+                  (70, 6), (76, 9), (83, 17), (89, 29), (92, 38), (92, 46), (88, 48),
+                  (82, 45), (74, 40), (65, 41), (58, 46), (55, 50), (38, 50),
+                  (32, 44), (26, 42), (19, 43), (13, 48), (10, 51))),
+    (0xFFD8E6F1, ((14, 46), (20, 42), (28, 41), (36, 44), (52, 47), (60, 42),
+                  (69, 40), (80, 43), (86, 47), (87, 50), (81, 50), (75, 45),
+                  (66, 44), (59, 49), (56, 52), (37, 52), (31, 46), (25, 44), (20, 45))),
+    (PLOW_INK, ((44, 20), (48, 12), (52, 8), (69, 8), (75, 10), (81, 16), (87, 27),
+                (90, 36), (77, 36), (52, 31), (46, 28), (44, 25))),
+    (0xFF31566E, ((46, 21), (50, 13), (54, 10), (62, 10), (62, 31), (53, 29), (48, 26))),
+    (0xFF294E67, ((63, 10), (70, 10), (75, 12), (80, 17), (85, 27), (88, 34), (77, 34), (64, 31))),
+    (0xFF54849E, ((74, 11), (78, 14), (66, 31), (63, 30), (63, 27))),
+    (0xFF416D89, ((81, 19), (83, 22), (75, 34), (71, 33))),
+    (0xFF17384D, ((46, 22), (54, 23), (60, 27), (62, 31), (52, 29), (48, 26))),
+    (0xFF078C9E, ((37, 40), (52, 40), (54, 41), (52, 43), (38, 43), (36, 42))),
+    (PLOW_CYAN, ((38, 41), (52, 41), (51, 42), (38, 42))),
+    # Headlight, rear marker and the amber roof beacon.
+    (0xFF165361, ((80, 35), (89, 35), (92, 37), (92, 41), (82, 40))),
+    (PLOW_CYAN, ((82, 36), (89, 36), (91, 38), (91, 39), (83, 39))),
+    (0xFFE7FFFF, ((84, 37), (89, 37), (90, 38), (84, 38))),
+    (0xFFFF975A, ((4, 37), (7, 39), (9, 42), (6, 42))),
+    (PLOW_INK, ((56, 5), (67, 5), (68, 7), (55, 7))),
+    (0xFFE08315, ((56, 4), (57, 1), (60, 0), (65, 0), (67, 2), (67, 5), (56, 5))),
+    (0xFFFFBF43, ((57, 4), (58, 2), (60, 1), (64, 1), (66, 2), (66, 4))),
+    (0xFFFFE698, ((59, 2), (64, 2), (65, 3), (59, 3))),
+)
+PLOW_SCOOP = (
+    # Articulated bracket and the curved inner face of the front blade.
+    (PLOW_INK, ((87, 44), (92, 44), (103, 54), (102, 59), (96, 58), (86, 49))),
+    (0xFF677F96, ((89, 45), (92, 45), (101, 53), (98, 55), (89, 48))),
+    (0xFF268EA1, ((91, 55), (92, 48), (95, 43), (100, 39), (106, 38), *SCOOP_EDGE,
+                  (101, 64), (95, 62))),
+    (0xFF65CFE2, ((93, 55), (94, 49), (97, 43), (102, 40), (106, 39), (122, 39),
+                  (119, 44), (117, 49), (118, 54), (121, 59), (125, 63),
+                  (102, 63), (97, 61))),
+    (0xFF399FB6, ((99, 45), (103, 42), (108, 41), (121, 41), (119, 45), (117, 49), (97, 49))),
+    (0xFF79DDEC, ((97, 53), (118, 52), (119, 55), (122, 59), (98, 59), (96, 56))),
+    (0xFFC1F5FA, ((92, 55), (93, 49), (96, 44), (101, 40), (106, 38), (121, 38),
+                  (123, 39), (122, 40), (106, 40), (101, 42), (98, 45), (96, 49),
+                  (95, 54), (97, 59), (101, 63), (98, 63), (94, 60))),
+    (0xFFB5EEF4, ((98, 59), (122, 59), (123, 60), (99, 61))),
+    (0xFF45AFBE, ((100, 62), (124, 61), (126, 63), (125, 64), (102, 64))),
 )
 
 
@@ -237,12 +305,35 @@ def merge_bands(rectangles, max_bands=4):
     return bands
 
 
+def _raster_tile(width, height, paint):
+    bitmap, graphics = Handle(), Handle()
+    pixels = (ct.c_ubyte * (width * height * 4))()
+    try:
+        check(create_bitmap(width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, pixels,
+                            ct.byref(bitmap)), "GdipCreateBitmapFromScan0")
+        try:
+            check(create_graphics(bitmap, ct.byref(graphics)), "GdipGetImageGraphicsContext")
+            check(set_smoothing(graphics, SMOOTHING_ANTIALIAS), "GdipSetSmoothingMode")
+            paint(graphics)
+            check(flush_graphics(graphics, FLUSH_SYNC), "GdipFlush")
+        finally:
+            if graphics:
+                delete_graphics(graphics)
+    except BaseException:
+        if bitmap:
+            dispose_bitmap(bitmap)
+        raise
+    # GDI+ borrows the backing pixels for the life of the bitmap.
+    return bitmap, pixels
+
+
 class PaintEngine:
     def __init__(self):
         self.token = ct.c_size_t()
         self.brushes = {}
         self.flake_brushes = None
         self.costume_tiles = OrderedDict()
+        self.plow_tiles = {}
         settings = StartupInput(1, None, False, True)
         check(startup(ct.byref(self.token), ct.byref(settings), None), "GdiplusStartup")
 
@@ -261,9 +352,10 @@ class PaintEngine:
         return self.flake_brushes
 
     def close(self):
-        for bitmap, *_ in self.costume_tiles.values():
+        for bitmap, _ in chain(self.costume_tiles.values(), self.plow_tiles.values()):
             dispose_bitmap(bitmap)
         self.costume_tiles.clear()
+        self.plow_tiles.clear()
         for brush in self.brushes.values():
             delete_brush(brush)
         self.brushes.clear()
@@ -498,26 +590,14 @@ class SnowScreen:
             if key not in self._previous_costume_poses:
                 return False
             body, head = radii[-2:]
-            bitmap, graphics = Handle(), Handle()
-            pixels = (ct.c_ubyte * (width * height * 4))()
-            try:
-                check(create_bitmap(width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, pixels,
-                                    ct.byref(bitmap)), "GdipCreateBitmapFromScan0")
-                try:
-                    check(create_graphics(bitmap, ct.byref(graphics)), "GdipGetImageGraphicsContext")
-                    check(set_smoothing(graphics, SMOOTHING_ANTIALIAS), "GdipSetSmoothingMode")
-                    check(translate_graphics(graphics, -tx, -ty, 0), "GdipTranslateWorldTransform")
-                    self._draw_classic(graphics, x, body_y, head_y, body, head)
-                    check(flush_graphics(graphics, FLUSH_SYNC), "GdipFlush")
-                finally:
-                    if graphics:
-                        delete_graphics(graphics)
-            except BaseException:
-                if bitmap:
-                    dispose_bitmap(bitmap)
-                raise
-            # The bitmap borrows the pixel buffer. Keep both alive until eviction.
-            cache[key] = bitmap, pixels
+
+            def paint(graphics):
+                check(translate_graphics(graphics, -tx, -ty, 0), "GdipTranslateWorldTransform")
+                self._draw_classic(graphics, x, body_y, head_y, body, head)
+
+            tile = _raster_tile(width, height, paint)
+            cache[key] = tile
+            bitmap, _ = tile
             if len(cache) > COSTUME_CACHE_LIMIT:
                 _, (old_bitmap, _old_pixels) = cache.popitem(last=False)
                 dispose_bitmap(old_bitmap)
@@ -555,6 +635,94 @@ class SnowScreen:
         self._painted_box(painted, bounds, (x1, y1, x2, y))
         for color, points in SHOVEL_SHAPES:
             self._polygon(self.engine.brush(color), tuple((x + sign * dx, y + dy) for dx, dy in points))
+
+    def _draw_plow(self, graphics, level, part):
+        # A transparent pixel around the sprite preserves its antialiased silhouette.
+        check(translate_graphics(graphics, 1, 1, 0), "GdipTranslateWorldTransform")
+        check(scale_graphics(graphics, PLOW_SCALE, PLOW_SCALE, 0), "GdipScaleWorldTransform")
+        if part != "blade":
+            self._draw_plow_body(graphics, level)
+        if part != "body":
+            shapes = PLOW_SCOOP[2:] if part == "blade" else PLOW_SCOOP
+            self._costume_shapes(graphics, shapes, 0, 0, 1)
+            for x in (104, 111, 118):
+                self._circle(self.engine.brush(0xFF2D899C), x, 62.5, 0.7, graphics=graphics)
+
+    def _draw_plow_body(self, graphics, level):
+        self._costume_shapes(graphics, PLOW_SHELL, 0, 0, 1)
+        if level:
+            fill = level / PLOW_FILL_STEPS
+            crest = 26 - 9 * fill
+            snow = ((6, 26), (9, crest + 2 * fill), (14, crest), (19, crest + fill),
+                    (24, crest - 1.5 * fill), (29, crest), (34, crest + fill),
+                    (39, crest + 3 * fill), (40, 26))
+            self._polygon(self.engine.brush(SNOW_SHADOW), snow, graphics=graphics)
+            highlight = ((9, crest + 2 * fill), (14, crest), (19, crest + fill),
+                         (24, crest - 1.5 * fill), (29, crest), (34, crest + fill),
+                         (38, crest + 3 * fill), (29, crest + 2 * fill),
+                         (17, crest + 3 * fill), (9, crest + 4 * fill))
+            self._polygon(self.engine.brush(SNOW_LIGHT), highlight, graphics=graphics)
+        for wheel in (24, 69):
+            for color, radius in ((0xFF101722, 12), (0xFF283442, 9.7), (0xFF1095A9, 7.2),
+                                  (PLOW_CYAN, 6.5), (0xFF243749, 5.1), (0xFF344C60, 2.0)):
+                self._circle(self.engine.brush(color), wheel, 52, radius, graphics=graphics)
+            tread = self.engine.brush(0xFF3B4655)
+            for dx, dy in ((-10, 0), (-7, -7), (0, -10), (7, -7), (10, 0)):
+                self._circle(tread, wheel + dx, 52 + dy, 0.9, graphics=graphics)
+    def _plow_tile(self, level, part, width, height):
+        tiles = self.engine.plow_tiles
+        key = level, part
+        tile = tiles.get(key)
+        if tile is None:
+            tile = tiles[key] = _raster_tile(width, height, lambda graphics: self._draw_plow(graphics, level, part))
+        return tile[0]
+
+    def _paint_plow(self, plow, pitch, bounds, painted):
+        blade_x, baseline, fill, chips = plow
+        left, top, right, bottom = bounds
+        chip_brush = self.engine.brush(SNOW_LIGHT)
+        for cx, cy, radius in chips:
+            x1, y1, x2, y2 = cx - radius, cy - radius, cx + radius, cy + radius
+            if x1 < right and y1 < bottom and x2 >= left and y2 >= top:
+                self._painted_box(painted, bounds, (x1, y1, x2, y2))
+                self._circle(chip_brush, cx, cy, radius)
+        x, y = round(blade_x), round(baseline)
+        x1, y1 = x - VEHICLE_LENGTH, y - VEHICLE_HEIGHT
+        level = ceil(PLOW_FILL_STEPS * min(1.0, max(0.0, fill)))
+        width, height = VEHICLE_LENGTH + 2, VEHICLE_HEIGHT + 2
+        if pitch:
+            angle_x, angle_y = cos(pitch), sin(pitch)
+
+            def turn(px, py):
+                dx, dy = px - x, py - y
+                return x + dx * angle_x - dy * angle_y, y + dx * angle_y + dy * angle_x
+
+            corners = tuple(turn(px, py) for px, py in ((x1 - 1, y1 - 1), (x + 1, y1 - 1),
+                                                        (x1 - 1, y + 1), (x + 1, y + 1)))
+            xs, ys = zip(*corners)
+            box = union_bounds((x1, y1, x, y), (min(xs), min(ys), max(xs), max(ys)))
+            if box[2] < left or box[3] < top or box[0] >= right or box[1] >= bottom:
+                return
+            self._painted_box(painted, bounds, box)
+            # The cab pitches with the wheels while the articulated scoop keeps its contact pose.
+            arm_x, arm_y = turn(x1 + 91 * PLOW_SCALE, y1 + 47 * PLOW_SCALE)
+            blade_arm_x, blade_arm_y = x1 + 102 * PLOW_SCALE, y1 + 55 * PLOW_SCALE
+            self._polygon(self.engine.brush(PLOW_INK), (
+                (arm_x - 3, arm_y - 4), (blade_arm_x, blade_arm_y - 4),
+                (blade_arm_x, blade_arm_y + 4), (arm_x - 3, arm_y + 4),
+            ))
+            body = self._plow_tile(level, "body", width, height)
+            points = (PointF * 3)(*(PointF(*point) for point in corners[:3]))
+            check(draw_bitmap_points(self.graphics, body, points, 3, 0, 0, width, height,
+                                     UNIT_PIXEL, None, None, None), "GdipDrawImagePointsRect")
+            bitmap = self._plow_tile(0, "blade", width, height)
+        else:
+            if x < left or y < top or x1 >= right or y1 >= bottom:
+                return
+            self._painted_box(painted, bounds, (x1, y1, x, y))
+            bitmap = self._plow_tile(level, "flat", width, height)
+        check(draw_bitmap(self.graphics, bitmap, x1 - 1, y1 - 1, width, height,
+                          0, 0, width, height, UNIT_PIXEL, None, None, None), "GdipDrawImageRectRectI")
 
     def _clear_previous(self):
         overlay = self.overlay
@@ -616,11 +784,11 @@ class SnowScreen:
             if len(radii) >= 3:
                 self._paint_classic(x, y, radii, bounds, painted, cache_details=True)
 
-    def _paint_flakes(self, flakes, bounds, painted):
+    def _paint_flakes(self, flakes, bounds, painted, *, airborne=False):
         left, top, right, bottom = bounds
         graphics = self.graphics
         brushes = self.engine.flake_palette()
-        blockers = self._flake_occluders
+        blockers = () if airborne else self._flake_occluders
         local_boxes = []
         for flake in flakes:
             x, y, radius = flake.x, flake.y, flake.radius
@@ -631,7 +799,7 @@ class SnowScreen:
                 if bx1 <= x1 and bx2 >= x2 and by1 <= y1 and by2 >= y2:
                     break
             else:
-                if len(local_boxes) <= 48:
+                if airborne or len(local_boxes) <= 48:
                     self._painted_box(local_boxes, bounds, (x1, y1, x2, y2))
                 brush = brushes[min(16, (flake.alpha + 8) // 16)]
                 size = radius * 2
@@ -642,6 +810,10 @@ class SnowScreen:
         # For dense snow, use the cached visible bands instead of tracking each flake.
         if len(local_boxes) <= 48:
             painted.extend(local_boxes)
+            return 4
+        if airborne:
+            painted.append((min(box[0] for box in local_boxes), min(box[1] for box in local_boxes),
+                            max(box[2] for box in local_boxes), max(box[3] for box in local_boxes)))
             return 4
         bands = self._dense_flake_bands or (bounds,)
         painted.extend(bands)
@@ -742,11 +914,15 @@ class SnowScreen:
                 delete_region(region)
 
     def render(self, flakes, drifts, snowmen=(), windows=(), work_area=None, platforms=(),
-               *, snowmen_owners=(), shovel=None, costumes=(), cache_costumes=False):
-        if self.interactive and not (drifts or snowmen or shovel is not None):
-            if self.visible:
-                self.hide()
-            return
+               *, snowmen_owners=(), shovel=None, costumes=(), cache_costumes=False, plow=None,
+               plow_pitch=0.0, impact_flakes=()):
+        if self.interactive:
+            plow = None
+            impact_flakes = ()
+            if not (drifts or snowmen or shovel is not None):
+                if self.visible:
+                    self.hide()
+                return
         drift_layers = {}
         for polygon in drifts:
             drift_layers.setdefault(getattr(polygon, "hwnd", 0), []).append(polygon)
@@ -759,13 +935,15 @@ class SnowScreen:
             for owner, figure in costumes:
                 costume_layers.setdefault(owner, []).append(figure)
         owners = (drift_layers.keys() | figure_layers.keys() | costume_layers.keys()) - {0}
+        if impact_flakes:
+            owners.add(FLYING_BALL_LAYER)
         self._update_clips(windows, work_area, platforms, owners)
         if not self._clips:
             if self.visible:
                 self.hide()
             return
-        if not flakes:
-            scene = self._clip_key, drift_layers, figure_layers, costume_layers, shovel
+        if not flakes and not impact_flakes:
+            scene = self._clip_key, drift_layers, figure_layers, costume_layers, shovel, plow, plow_pitch
             if self.visible and scene == self._stationary_scene:
                 self.overlay.move_to_destination()
                 return
@@ -800,10 +978,18 @@ class SnowScreen:
             bounds = self._apply_clip(0)
             if bounds is not None:
                 band_limit = self._paint_flakes(flakes, bounds, painted)
+        if impact_flakes:
+            bounds = self._apply_clip(FLYING_BALL_LAYER)
+            if bounds is not None:
+                self._paint_flakes(impact_flakes, bounds, painted, airborne=True)
         if shovel is not None:
             bounds = self._apply_clip(0)
             if bounds is not None:
                 self._paint_shovel(shovel, bounds, painted)
+        if plow is not None:
+            bounds = self._apply_clip(0)
+            if bounds is not None:
+                self._paint_plow(plow, plow_pitch, bounds, painted)
         bands = merge_bands(painted, max_bands=band_limit)
         dirty = merge_bands((*self._painted_bands, *bands),
                             max_bands=max(band_limit, len(self._painted_bands)))
