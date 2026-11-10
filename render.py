@@ -281,8 +281,8 @@ def merge_bands(rectangles, max_bands=4):
     for rect in rectangles:
         for index in range(len(bands) - 1, -1, -1):
             other = bands[index]
-            if (min(rect[2], other[2]) + 12 >= max(rect[0], other[0])
-                    and min(rect[3], other[3]) + 12 >= max(rect[1], other[1])):
+            if (rect[2] + 12 >= other[0] and other[2] + 12 >= rect[0]
+                    and rect[3] + 12 >= other[1] and other[3] + 12 >= rect[1]):
                 joined = union_bounds(rect, other)
                 # Touching strips can surround a large app-window hole. Joining
                 # them would upload that whole blank area again.
@@ -346,9 +346,10 @@ class PaintEngine:
 
     def flake_palette(self):
         if self.flake_brushes is None:
-            self.flake_brushes = tuple(
+            levels = tuple(
                 self.brush((min(255, step * 16) << 24) | FLAKE_RGB) for step in range(17)
             )
+            self.flake_brushes = tuple(levels[(alpha + 8) // 16] for alpha in range(256))
         return self.flake_brushes
 
     def close(self):
@@ -529,8 +530,14 @@ class SnowScreen:
             delete_path(path)
 
     def _polygon(self, brush, polygon, *, graphics=None):
-        coordinates = array("f", chain.from_iterable(polygon))
-        points = (PointF * len(polygon)).from_buffer(coordinates)
+        drift = isinstance(polygon, DriftPolygon)
+        points = polygon.paint_points if drift else None
+        if points is None:
+            coordinates = array("f", chain.from_iterable(polygon))
+            points = (PointF * len(polygon)).from_buffer(coordinates)
+            if drift:
+                # Bank shapes are replaced as snow or geometry changes.
+                polygon.paint_points = points
         check(fill_polygon(self.graphics if graphics is None else graphics,
                            brush, points, len(points), FILL_ALTERNATE),
               "GdipFillPolygon")
@@ -801,7 +808,7 @@ class SnowScreen:
             else:
                 if airborne or len(local_boxes) <= 48:
                     self._painted_box(local_boxes, bounds, (x1, y1, x2, y2))
-                brush = brushes[min(16, (flake.alpha + 8) // 16)]
+                brush = brushes[flake.alpha]
                 size = radius * 2
                 status = fill_ellipse(graphics, brush, x1, y1, size, size)
                 if status:

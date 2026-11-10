@@ -32,6 +32,8 @@ SHOVEL_STEP = 8
 SHOVEL_TAIL = 12
 MAX_IMPACT_GRAINS = 144
 IMPACT_GRAVITY = 1450.0
+BANK_GRAVITY = 760.0
+BANK_AIR_DRAG = 1.15
 
 
 def _platform_top(platform: Platform, x: float) -> float:
@@ -75,7 +77,7 @@ def _ground_spans(ground: Rect, platforms: Sequence[Platform]) -> tuple[GroundSp
 class DriftPolygon(list[Point]):
     """List-compatible bank outline with its supporting window and paint bounds."""
 
-    __slots__ = ("hwnd", "left", "right", "top", "bottom", "curved")
+    __slots__ = ("hwnd", "left", "right", "top", "bottom", "curved", "paint_points")
 
     def __init__(self, points: Iterable[Point], hwnd: int, left: float, right: float, curved: bool):
         super().__init__(points)
@@ -84,6 +86,7 @@ class DriftPolygon(list[Point]):
         self.top = min(map(_POINT_Y, self))
         self.bottom = max(map(_POINT_Y, self)) if curved else self[0][1]
         self.curved = curved
+        self.paint_points = None
 
 
 @dataclass(slots=True)
@@ -95,6 +98,8 @@ class _FallingBank:
     speed: float = 0.0
     impact_height: int = 0
     expanded: set[int] = field(default_factory=set)
+    offset_x: float = 0.0
+    vx: float = 0.0
 
     def trim(self) -> None:
         spans = []
@@ -208,6 +213,7 @@ class _Pile:
     vy: float = 0.0
     revision: int = 0
     impact_ceiling: int = 0
+    roof_vx: float = 0.0
 
     def depth_at(self, x: float) -> float:
         if not self.depths:
@@ -280,25 +286,6 @@ class _Pile:
         self.revision += 1
         return [(moment / volume, volume) for moment, volume in
                 ((left_moment, left_volume), (right_moment, right_volume)) if volume >= 1.0]
-
-    def loosen(self, fraction: float) -> Iterator[tuple[float, float]]:
-        """Take small groups from a pile when its support drops away."""
-        if not self.depths:
-            return
-        self.revision += 1
-        step = self.width / len(self.depths)
-        stride = ceil(len(self.depths) / 7)
-        for start in range(0, len(self.depths), stride):
-            end = min(start + stride, len(self.depths))
-            volume = 0.0
-            moment = 0.0
-            for index in range(start, end):
-                removed = self.depths[index] * fraction
-                self.depths[index] -= removed
-                volume += removed * step
-                moment += (index + 0.5) * step * removed * step
-            if volume >= 1.0:
-                yield moment / volume, volume
 
 
 @dataclass(slots=True)
@@ -538,6 +525,7 @@ class SnowSimulation:
         self._ground_piles: list[_Pile] = []
         self._desktop_bounds: tuple[int, int, int] = (0, 0, 0)
         self._windows: tuple[Window, ...] = ()
+        self._rising_roofs: dict[int, int] = {}
         self._window_rank: dict[int, int] = {}
         self._piles: dict[int, _Pile] = {}
         self._surfaces: list[_Surface] = []
@@ -755,6 +743,7 @@ class SnowSimulation:
         """Set (HWND, left, top, right, bottom) for visible windows, frontmost first."""
         snapshot = tuple(window for window in windows if window[1] < window[3] and window[2] < window[4])
         changed = snapshot != self._windows
+        self._rising_roofs.clear()
         if not changed and not self._sliding:
             return
         elapsed = min(0.12, max(1 / 240, elapsed))
@@ -767,11 +756,16 @@ class SnowSimulation:
                 pile = _Pile(right - left, [])
             elif pile.depths:
                 _, old_left, old_top, _, _ = previous[hwnd]
-                self._move_pile(pile, left, top, right - left, old_left, old_top, elapsed)
-                self._sliding |= bool(pile.vx or pile.vy)
+                dx, dy = left - old_left, top - old_top
+                vx = dx / elapsed if abs(dx) > 1 and right - left == pile.width else 0.0
+                self._detach_bank(hwnd, pile, dy, vx, elapsed)
+                pile.roof_vx = vx if dy < -1 else 0.0
+                pile.vy = dy / elapsed if abs(dy) > 1 else 0.0
+                self._slide_pile(pile, left, top, right - left, old_left, old_top, elapsed)
+                self._sliding |= bool(pile.depths and (pile.vx or pile.vy))
             else:
                 pile.width = right - left
-                pile.vx = pile.vy = 0.0
+                pile.vx = pile.vy = pile.roof_vx = 0.0
             current[hwnd] = pile
         if changed:
             closed = previous.keys() - current.keys()
@@ -779,14 +773,37 @@ class SnowSimulation:
                 for surface in self._surfaces:
                     if surface.hwnd in closed:
                         self._release_bank(surface)
+            if self._falling_banks:
+                for hwnd, _, top, _, _ in snapshot:
+                    if hwnd in previous and top < previous[hwnd][2]:
+                        self._rising_roofs[hwnd] = previous[hwnd][2]
         self._piles = current
         self._windows = snapshot
         if changed:
             self._window_rank = {window[0]: index for index, window in enumerate(snapshot)}
             self._rebuild_surfaces()
 
-    def _move_pile(self, pile, left, top, width, old_left, old_top, dt):
-        dx, dy = left - old_left, top - old_top
+    def _detach_bank(self, hwnd: int, pile: _Pile, dy: int, vx: float, dt: float) -> None:
+        speed = min(880.0, max(-320.0, pile.vy))
+        fall = (speed + 0.5 * BANK_GRAVITY * dt) * dt
+        # A ledge can push snow upwards, but it cannot pull it back down.
+        if (dy <= 1 and speed >= 0) or dy - fall <= 3:
+            return
+        # A downward flick imparts a sideways push; an upward bank keeps the
+        # sideways motion from before the roof braked.
+        launch_vx = vx if dy > 1 and vx else pile.roof_vx
+        throw_vx = min(840.0, max(-840.0, 0.60 * launch_vx))
+        released = [0.0] * len(pile.depths)
+        for surface in self._surfaces:
+            if surface.hwnd == hwnd:
+                self._release_bank(surface, speed=speed, vx=throw_vx, released=released)
+        if any(released):
+            remaining = [max(0.0, depth - removed) for depth, removed in zip(pile.depths, released)]
+            pile.depths = remaining if any(remaining) else []
+            pile.revision += 1
+
+    def _slide_pile(self, pile, left, top, width, old_left, old_top, dt):
+        dx = left - old_left
         # Static friction prevents a one-pixel frame wobble from shaking loose snow.
         if abs(dx) <= 1 and abs(pile.vx) < 7 and width == pile.width:
             pile.vx = 0.0
@@ -796,17 +813,6 @@ class SnowSimulation:
             shift = pile.vx * dt - dx
             for x, volume in pile.slide(width, shift):
                 self._spill(left + x, min(top, old_top) - 3, volume, pile.vx, 0.0)
-        if dy > 3:
-            speed = min(2400, dy / dt)
-            # A fast downward tug removes support faster than gravity can follow.
-            acceleration = (speed - pile.vy) / dt
-            if speed > 240 and acceleration > 1200:
-                fraction = min(0.48, (acceleration - 1200) / 42000)
-                for x, volume in pile.loosen(fraction):
-                    self._spill(left + x, old_top - 3, volume, pile.vx, min(pile.vy, 160))
-            pile.vy = speed
-        else:
-            pile.vy = 0.0
 
     def _rebuild_surfaces(self) -> None:
         surfaces = []
@@ -882,11 +888,12 @@ class SnowSimulation:
         """Drop all flakes and drifts, retaining the current display and window geometry."""
         self.particles.clear()
         self._falling_banks.clear()
+        self._rising_roofs.clear()
         self._impact_powder.clear()
         tall = False
         for pile in (*self._piles.values(), *self._ground_piles):
             pile.depths.clear()
-            pile.vx = pile.vy = 0.0
+            pile.vx = pile.vy = pile.roof_vx = 0.0
             pile.revision += 1
             if pile.impact_ceiling:
                 pile.impact_ceiling = 0
@@ -1364,7 +1371,8 @@ class SnowSimulation:
                               radius, vx * 0.72 + self._random.uniform(-38, 38),
                               vy + self._random.uniform(-38, 18), volume=each)
 
-    def _release_bank(self, surface: _Surface) -> None:
+    def _release_bank(self, surface: _Surface, *, speed: float = 0.0, vx: float = 0.0,
+                      released: list[float] | None = None) -> None:
         outline = self._bank_shape(surface)
         if outline is None:
             return
@@ -1379,9 +1387,12 @@ class SnowSimulation:
             right = min(surface.right, origin + (index + 1) * step)
             if depth > 0 and left < right:
                 columns.append((left, right, depth, depth))
+                if released is not None:
+                    released[index] += depth * (right - left) / step
         if columns:
             height = ceil(max(column[2] for column in columns)) if pile.impact_ceiling else 0
-            self._falling_banks.append(_FallingBank(outline, columns, (outline,), surface.y, impact_height=height))
+            self._falling_banks.append(_FallingBank(outline, columns, (outline,), surface.y,
+                                                    speed=speed, impact_height=height, vx=vx))
 
     @staticmethod
     def _settle_bank_column(surface, left, right, depth):
@@ -1407,22 +1418,52 @@ class SnowSimulation:
             pile.revision += 1
         return max(0.0, remaining - removed) / (right - left)
 
-    def _bank_candidates(self, bank: _FallingBank, old_y: float) -> list[_Surface]:
+    def _bank_candidates(self, bank: _FallingBank, old_y: float, old_offset: float) -> list[_Surface]:
+        left = bank.columns[0][0] + min(old_offset, bank.offset_x)
+        right = bank.columns[-1][1] + max(old_offset, bank.offset_x)
+        if self._rising_roofs:
+            # The new roof can already be above the bank after a fast upward drag.
+            return [surface for surface in self._surfaces[:bisect_right(self._surface_ys, bank.y)]
+                    if (old_y - self._curve_reach <= self._rising_roofs.get(surface.hwnd, surface.y)
+                        and surface.left < right and surface.right > left)]
+        if bank.y < old_y:
+            return []
         start = bisect_left(self._surface_ys, old_y - self._curve_reach)
         end = bisect_right(self._surface_ys, bank.y)
         return [surface for surface in self._surfaces[start:end]
-                if surface.left < bank.outline.right and surface.right > bank.outline.left]
+                if surface.left < right and surface.right > left]
 
-    def _allow_falling_mound(self, bank: _FallingBank, candidates: list[_Surface], old_y: float) -> bool:
+    def _bank_crossings(
+        self, bank: _FallingBank, old_y: float, old_offset: float,
+    ) -> list[tuple[_Surface, tuple[float, float] | None]]:
+        crossings = []
+        for surface in self._bank_candidates(bank, old_y, old_offset):
+            if surface.platform:
+                # The curved taskbar contact depends on each column's x.
+                crossings.append((surface, None))
+            else:
+                crossing = self._bank_contact(surface, bank, old_y, old_offset)
+                if crossing is not None:
+                    crossings.append((surface, crossing))
+        return crossings
+
+    def _allow_falling_mound(self, bank: _FallingBank,
+                            crossings: list[tuple[_Surface, tuple[float, float] | None]],
+                            old_y: float, old_offset: float) -> bool:
         expanded = False
-        for surface in candidates:
+        for surface, flat_crossing in crossings:
             pile = surface.pile
             key = id(pile)
             if key in bank.expanded:
                 continue
-            if not any(surface.left <= (left + right) / 2 < surface.right
-                       and old_y <= surface.baseline_at((left + right) / 2) <= bank.y
-                       for left, right, _, _ in bank.columns):
+            if flat_crossing is None:
+                hit = any(self._bank_contact(surface, bank, old_y, old_offset, x=(left + right) / 2)
+                          is not None for left, right, _, _ in bank.columns)
+            else:
+                _, offset = flat_crossing
+                hit = any(surface.left <= (left + right) / 2 + offset < surface.right
+                          for left, right, _, _ in bank.columns)
+            if not hit:
                 continue
             bank.expanded.add(key)
             ceiling = ceil(max(pile.depths, default=0.0)) + bank.impact_height
@@ -1431,35 +1472,68 @@ class SnowSimulation:
                 expanded = True
         return expanded
 
+    def _bank_contact(self, surface: _Surface, bank: _FallingBank, old_y: float,
+                      old_offset: float, *, x: float | None = None) -> tuple[float, float] | None:
+        """Find the time and offset of a flat ledge crossing or a curved contact."""
+        dx = bank.offset_x - old_offset
+        if x is not None and dx:
+            dy = bank.y - old_y
+            if dy <= 0:
+                return None
+            time = surface.crossing_time(x + old_offset, old_y, dx, dy)
+            return (time, old_offset + dx * time) if time is not None else None
+        y = surface.y if x is None else surface.baseline_at(x + old_offset)
+        gap = self._rising_roofs.get(surface.hwnd, y) - old_y
+        penetration = bank.y - y
+        if gap < 0 or penetration < 0:
+            return None
+        time = gap / (gap + penetration) if gap else 0.0
+        offset = old_offset + dx * time
+        if x is None or surface.left <= x + offset < surface.right:
+            return time, offset
+        return None
+
     def _advance_banks(self, dt: float) -> None:
         falling = []
-        bottom = self._desktop_bounds[2]
+        desktop_left, desktop_right, bottom = self._desktop_bounds
         for bank in self._falling_banks:
-            old_y = bank.y
-            bank.y += (bank.speed + 380 * dt) * dt
-            bank.speed = min(880, bank.speed + 760 * dt)
-            candidates = self._bank_candidates(bank, old_y)
-            if bank.impact_height and self._allow_falling_mound(bank, candidates, old_y):
+            old_y, old_offset = bank.y, bank.offset_x
+            bank.y += (bank.speed + 0.5 * BANK_GRAVITY * dt) * dt
+            bank.speed = min(880, bank.speed + BANK_GRAVITY * dt)
+            if bank.vx:
+                decay = exp(-BANK_AIR_DRAG * dt)
+                offset = old_offset + bank.vx * (1 - decay) / BANK_AIR_DRAG
+                bank.offset_x = min(desktop_right - bank.columns[-1][1],
+                                    max(desktop_left - bank.columns[0][0], offset))
+                bank.vx = bank.vx * decay if bank.offset_x == offset else 0.0
+            crossings = self._bank_crossings(bank, old_y, old_offset)
+            if bank.impact_height and self._allow_falling_mound(bank, crossings, old_y, old_offset):
                 self._rebuild_surfaces()
-                candidates = self._bank_candidates(bank, old_y)
-            if candidates:
+                crossings = self._bank_crossings(bank, old_y, old_offset)
+            if crossings:
                 columns = []
                 for left, right, depth, original in bank.columns:
                     x = (left + right) / 2
                     contacts = []
-                    for surface in candidates:
-                        if not surface.left <= x < surface.right:
-                            continue
-                        y = surface.baseline_at(x)
-                        if not old_y <= y <= bank.y:
-                            continue
-                        if surface.platform and any(
-                            x1 <= x < x2 and y1 < y <= y2 for _, x1, y1, x2, y2 in self._windows
-                        ):
-                            continue
-                        contacts.append((y, surface))
-                    for _, surface in sorted(contacts, key=itemgetter(0)):
-                        depth = self._settle_bank_column(surface, left, right, depth)
+                    for surface, flat_crossing in crossings:
+                        if flat_crossing is None:
+                            contact = self._bank_contact(surface, bank, old_y, old_offset, x=x)
+                            if contact is None:
+                                continue
+                            time, offset = contact
+                            hit_x = x + offset
+                            hit_y = surface.baseline_at(hit_x)
+                            if any(x1 <= hit_x < x2 and y1 < hit_y <= y2
+                                   for _, x1, y1, x2, y2 in self._windows):
+                                continue
+                        else:
+                            time, offset = flat_crossing
+                            if not surface.left <= x + offset < surface.right:
+                                continue
+                        contacts.append((time, offset, surface))
+                    contacts.sort(key=itemgetter(0))
+                    for _, offset, surface in contacts:
+                        depth = self._settle_bank_column(surface, left + offset, right + offset, depth)
                         if depth <= 1e-9:
                             break
                     if depth > 1e-9:
@@ -1471,6 +1545,7 @@ class SnowSimulation:
             if bank.columns and bank.y + bank.outline.top - bank.outline.bottom < bottom:
                 falling.append(bank)
         self._falling_banks = falling
+        self._rising_roofs.clear()
 
     def _spawn(self, count: int, *, initial: bool = False) -> None:
         rng = self._random
@@ -1491,7 +1566,10 @@ class SnowSimulation:
             )
 
     def _landing(self, flake: Flake, x: float, y: float) -> _Surface | None:
-        old_base, new_base = flake.y + flake.radius, y + flake.radius
+        new_base = y + flake.radius
+        if new_base < self._first_landing_y:
+            return None
+        old_base = flake.y + flake.radius
         band = floor(new_base / LANDING_BAND)
         band_start = band * LANDING_BAND
         if old_base >= band_start:
@@ -1520,12 +1598,6 @@ class SnowSimulation:
                     landing = surface
         return landing
 
-    def _landing_on_open_desktop(self, flake: Flake, x: float, y: float) -> _Surface | None:
-        # There is nothing to land on until the flake approaches the floor or taskbar.
-        if y + flake.radius < self._first_landing_y:
-            return None
-        return self._landing(flake, x, y)
-
     def _landing_with_stationary_windows(self, flake: Flake, x: float, y: float) -> _Surface | None:
         base = y + flake.radius
         if base < flake._next_landing_base:
@@ -1543,7 +1615,7 @@ class SnowSimulation:
 
     def _frame_landing(self):
         if not self._windows:
-            return self._landing_on_open_desktop
+            return self._landing
         if self._previous_landing_bands is not self._landing_bands:
             self._previous_landing_bands = self._landing_bands
             self._stable_landing_frames = 0
@@ -1652,12 +1724,13 @@ class SnowSimulation:
         return surface.shape
 
     def falling_drifts(self) -> Iterator[DriftPolygon]:
-        """Translate each released outline vertically without changing its profile."""
+        """Translate each released outline without changing its profile."""
         for bank in self._falling_banks:
-            offset = round(bank.y - bank.outline.bottom)
+            dx = round(bank.offset_x)
+            dy = round(bank.y - bank.outline.bottom)
             for shape in bank.shapes:
-                yield DriftPolygon(((x, y + offset) for x, y in shape),
-                                   0, shape.left, shape.right, False)
+                yield DriftPolygon(((x + dx, y + dy) for x, y in shape),
+                                   0, shape.left + dx, shape.right + dx, False)
 
     def bank_at(self, x: float, y: float, margin: float = 1.25, *, hwnd: int | None = None,
                 visible: Visibility | None = None) -> bool:
