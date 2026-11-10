@@ -1,0 +1,2 @@
+# Runtime: CPython 3.10+ on Windows. No third-party packages are required.
+# build.ps1 installs PyInstaller separately for EXE packaging.
